@@ -3,7 +3,7 @@
   "version": "0.1.33",
   "description": "Small TypeScript SDK for authoring Adversaries.",
   "type": "module",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/doomerlabs/doomer-sdk-typescript.git"
@@ -27,7 +27,12 @@
     "./schemas/adversary.review.v1": "./schemas/adversary.review.v1.schema.json",
     "./schemas/adversary.outcome-context.v1": "./schemas/adversary.outcome-context.v1.schema.json"
   },
-  "files": ["dist", "schemas", "templates", "README.md"],
+  "files": [
+    "dist",
+    "schemas",
+    "templates",
+    "README.md"
+  ],
   "engines": {
     "node": ">=22"
   },
