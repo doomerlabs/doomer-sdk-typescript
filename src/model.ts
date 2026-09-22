@@ -20,17 +20,28 @@ const MAX_RESPONSE_BYTES = 4 << 20;
 const DEFAULT_BROKER_MAXIMUM_ATTEMPTS = 3;
 const DEFAULT_BROKER_RETRY_DELAY_MS = 250;
 const MAX_BROKER_RETRY_DELAY_MS = 5_000;
+const DEFAULT_VALIDATION_MAXIMUM_ATTEMPTS = 3;
+const MAX_VALIDATION_MAXIMUM_ATTEMPTS = 5;
+const MAX_VALIDATION_FEEDBACK_BYTES = 8 << 10;
 
 export interface ModelReviewBudget {
   maximumOutputTokens?: number;
   timeoutMs?: number;
 }
 
-export interface ModelReviewRequest {
+export interface ModelReviewValidation<T = unknown> {
+  /** Validate a completed model result. Throw to retry generation with the error as feedback. */
+  validate(result: ModelReviewResult<T>): void | Promise<void>;
+  /** Total generation attempts, including the first. Defaults to 3 and is capped at 5. */
+  maximumAttempts?: number;
+}
+
+export interface ModelReviewRequest<T = unknown> {
   prompt: string;
   input: unknown;
   schema: Record<string, unknown>;
   budget?: ModelReviewBudget;
+  validation?: ModelReviewValidation<T>;
   tools?: {
     repository: ModelRepositoryToolOptions;
   };
@@ -51,7 +62,7 @@ export interface ModelReviewResult<T = unknown> {
 }
 
 export interface ReviewModel {
-  review<T = unknown>(request: ModelReviewRequest): Promise<ModelReviewResult<T>>;
+  review<T = unknown>(request: ModelReviewRequest<T>): Promise<ModelReviewResult<T>>;
 }
 
 export interface BrokerReviewModelOptions {
@@ -92,7 +103,7 @@ export type ContextualReviewModel = ReviewModel & {
 
 export type ModelEnvironment = Readonly<Record<string, string | undefined>>;
 
-interface ModelBrokerRequest extends ModelReviewRequest {
+interface ModelBrokerRequest extends Omit<ModelReviewRequest, "validation" | "tools"> {
   protocolVersion: typeof ADVERSARY_MODEL_PROTOCOL_VERSION;
 }
 
@@ -112,7 +123,7 @@ interface ModelBrokerErrorResponse {
   };
 }
 
-type NormalizedModelReviewRequest = Omit<ModelReviewRequest, "budget"> & {
+type NormalizedModelReviewRequest = Omit<ModelReviewRequest, "budget" | "validation" | "tools"> & {
   budget: Required<ModelReviewBudget>;
 };
 
@@ -191,7 +202,7 @@ export class BrokerReviewModel implements ReviewModel {
     this.#random = options.random ?? Math.random;
   }
 
-  async review<T = unknown>(request: ModelReviewRequest): Promise<ModelReviewResult<T>> {
+  async review<T = unknown>(request: ModelReviewRequest<T>): Promise<ModelReviewResult<T>> {
     if (request.tools?.repository !== undefined) {
       throw new ModelReviewError(
         "Repository model tools require ctx.model so the SDK can enforce the repository boundary.",
@@ -301,6 +312,98 @@ export class BrokerReviewModel implements ReviewModel {
       ...(envelope.usage === undefined ? {} : { usage: envelope.usage }),
     };
   }
+}
+
+/**
+ * Run adversary-owned semantic validation with SDK-owned bounded regeneration.
+ *
+ * Each retry receives the validator failure as trusted SDK feedback while retaining the
+ * original input. The original timeout is shared by all validation attempts, and usage is
+ * aggregated across them. Repository callers may decorate the raw result with citations before
+ * validation without repeating repository retrieval.
+ */
+export async function reviewWithValidation<T>(
+  model: ReviewModel,
+  request: ModelReviewRequest<T>,
+  decorate: (result: ModelReviewResult<T>) => ModelReviewResult<T> = (result) => result,
+): Promise<ModelReviewResult<T>> {
+  const validation = request.validation;
+  const { validation: _validation, tools: _tools, ...baseRequest } = request;
+  if (validation === undefined) return decorate(await model.review<T>(baseRequest));
+
+  const maximumAttempts = validation.maximumAttempts ?? DEFAULT_VALIDATION_MAXIMUM_ATTEMPTS;
+  requireIntegerRange(
+    maximumAttempts,
+    "validation.maximumAttempts",
+    1,
+    MAX_VALIDATION_MAXIMUM_ATTEMPTS,
+  );
+  const timeoutMs = request.budget?.timeoutMs ?? DEFAULT_MODEL_TIMEOUT_MS;
+  const startedAt = Date.now();
+  let usage: ModelReviewUsage = {};
+  let feedback: string | undefined;
+
+  for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+    const elapsed = Date.now() - startedAt;
+    const remainingTimeoutMs = timeoutMs - elapsed;
+    if (remainingTimeoutMs <= 0) throw modelTimeoutError(timeoutMs);
+    const result = decorate(
+      await model.review<T>({
+        ...baseRequest,
+        prompt:
+          feedback === undefined
+            ? baseRequest.prompt
+            : `${baseRequest.prompt}\n\nSDK VALIDATION FEEDBACK:\nThe previous response failed adversary-defined validation. Correct the response using this trusted validation result and return the complete response again.\n${JSON.stringify({ attempt, error: feedback })}`,
+        budget: {
+          ...baseRequest.budget,
+          timeoutMs: remainingTimeoutMs,
+        },
+      }),
+    );
+    usage = addModelUsage(usage, result.usage);
+    try {
+      await validation.validate(result);
+      return {
+        ...result,
+        ...(usage.inputTokens === undefined && usage.outputTokens === undefined ? {} : { usage }),
+      };
+    } catch (error) {
+      feedback = boundedValidationFeedback(error);
+      if (attempt === maximumAttempts) {
+        throw new ModelReviewError(
+          `Model output failed adversary validation after ${maximumAttempts} attempts: ${feedback}`,
+          { code: "model_validation_failed", retryable: false },
+        );
+      }
+    }
+  }
+  throw new ModelReviewError("Model validation retry loop exhausted unexpectedly.", {
+    code: "model_validation_failed",
+    retryable: false,
+  });
+}
+
+function boundedValidationFeedback(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const encoded = Buffer.from(message, "utf8");
+  return encoded.byteLength <= MAX_VALIDATION_FEEDBACK_BYTES
+    ? message
+    : `${encoded.subarray(0, MAX_VALIDATION_FEEDBACK_BYTES).toString("utf8")}…`;
+}
+
+function addModelUsage(
+  total: ModelReviewUsage,
+  next: ModelReviewUsage | undefined,
+): ModelReviewUsage {
+  if (next === undefined) return total;
+  return {
+    ...(total.inputTokens === undefined && next.inputTokens === undefined
+      ? {}
+      : { inputTokens: (total.inputTokens ?? 0) + (next.inputTokens ?? 0) }),
+    ...(total.outputTokens === undefined && next.outputTokens === undefined
+      ? {}
+      : { outputTokens: (total.outputTokens ?? 0) + (next.outputTokens ?? 0) }),
+  };
 }
 
 async function waitForRetry(

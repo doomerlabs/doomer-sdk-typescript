@@ -155,6 +155,29 @@ const review = await ctx.model.review<{
 });
 ```
 
+Adversaries may add semantic validation that cannot be expressed by JSON Schema. The adversary
+owns the domain rule; the SDK owns bounded regeneration, feedback, timeout accounting, and usage
+aggregation:
+
+```ts
+const review = await ctx.model.review<EngineeringReview>({
+  prompt: ENGINEERING_REVIEW_PROMPT,
+  input: preparedInput,
+  schema: engineeringReviewSchema,
+  validation: {
+    maximumAttempts: 3,
+    validate: ({ output, citations }) => {
+      validateEngineeringReview(output, citations);
+    },
+  },
+});
+```
+
+Throw from `validate` to reject an answer. The SDK sends that error back as trusted validation
+feedback and retries only the final generation call. With repository tools, it reuses the already
+retrieved evidence and citations. Exhaustion raises a non-retryable `ModelReviewError` with code
+`model_validation_failed` so hosts do not restart the entire adversary review.
+
 For repository-scale reviews, add bounded repository tools instead of placing source bodies in
 `input`. The SDK asks the model which directories and line ranges it needs, performs those reads
 inside the rule context's repository boundary, and then makes the final structured review call:

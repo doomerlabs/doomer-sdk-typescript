@@ -68,6 +68,75 @@ describe("model review capability", () => {
     expect(result.observations).toEqual([{ key: "model.verdict", summary: "approve" }]);
   });
 
+  it("retries adversary validation with feedback and aggregated usage", async () => {
+    const prompts: string[] = [];
+    let calls = 0;
+    const model: ReviewModel = {
+      async review<T>(request: ModelReviewRequest<T>) {
+        calls += 1;
+        prompts.push(request.prompt);
+        expect(request.validation).toBeUndefined();
+        return {
+          output: { verdict: calls === 1 ? "incomplete" : "approve" } as T,
+          provider: "fixture",
+          model: "reviewer",
+          usage: { inputTokens: 10, outputTokens: 2 },
+        };
+      },
+    };
+    const app = new Adversary({ name: "adversarylabs/model-validation-test" });
+    let usage: { inputTokens?: number; outputTokens?: number } | undefined;
+    app.rule("review", async (ctx) => {
+      const result = await ctx.model.review<{ verdict: string }>({
+        prompt: "Review this change.",
+        input: {},
+        schema: { type: "object" },
+        validation: {
+          validate: ({ output }) => {
+            if (output.verdict !== "approve") throw new Error("verdict must be approve");
+          },
+        },
+      });
+      usage = result.usage;
+    });
+
+    await app.run({ input: { source: { path: process.cwd() } }, model });
+
+    expect(calls).toBe(2);
+    expect(prompts[0]).toBe("Review this change.");
+    expect(prompts[1]).toContain('"error":"verdict must be approve"');
+    expect(usage).toEqual({ inputTokens: 20, outputTokens: 4 });
+  });
+
+  it("returns a non-retryable typed error after validation attempts are exhausted", async () => {
+    const model: ReviewModel = {
+      async review<T>() {
+        return { output: { verdict: "incomplete" } as T, provider: "fixture", model: "reviewer" };
+      },
+    };
+    const app = new Adversary({ name: "adversarylabs/model-validation-failure-test" });
+    app.rule("review", async (ctx) => {
+      await ctx.model.review({
+        prompt: "Review this change.",
+        input: {},
+        schema: { type: "object" },
+        validation: {
+          maximumAttempts: 2,
+          validate: () => {
+            throw new Error("missing required finding");
+          },
+        },
+      });
+    });
+
+    await expect(
+      app.run({ input: { source: { path: process.cwd() } }, model }),
+    ).rejects.toMatchObject<ModelReviewError>({
+      code: "model_validation_failed",
+      retryable: false,
+    });
+  });
+
   it("fails explicitly when an adversary requests an unavailable model", async () => {
     await expect(
       unavailableModel().review({
@@ -251,6 +320,7 @@ describe("model review capability", () => {
         "export function important(): string {\n  return 'prepared evidence';\n}\n",
       );
       let planningCalls = 0;
+      let finalCalls = 0;
       let finalInput: unknown;
       const model: ReviewModel = {
         async review<T>(request: ModelReviewRequest) {
@@ -309,9 +379,11 @@ describe("model review capability", () => {
               usage: { inputTokens: 1, outputTokens: 1 },
             };
           }
+          finalCalls += 1;
+          expect(request.validation).toBeUndefined();
           finalInput = request.input;
           return {
-            output: { verdict: "approve" } as T,
+            output: { verdict: finalCalls === 1 ? "incomplete" : "approve" } as T,
             provider: "fixture",
             model: "reviewer",
             usage: { inputTokens: 2, outputTokens: 2 },
@@ -337,12 +409,19 @@ describe("model review capability", () => {
               maxToolCalls: 4,
             },
           },
+          validation: {
+            validate: (result) => {
+              expect(result.citations).toHaveLength(1);
+              if (result.output.verdict !== "approve") throw new Error("verdict must be approve");
+            },
+          },
         });
       });
 
       await app.run({ input: { source: { path: root } }, model });
 
       expect(planningCalls).toBe(3);
+      expect(finalCalls).toBe(2);
       expect(JSON.stringify(finalInput)).toContain("prepared evidence");
       expect(reviewResult?.citations).toEqual([
         {
@@ -360,7 +439,7 @@ describe("model review capability", () => {
         directoriesListed: 2,
         exhausted: false,
       });
-      expect(reviewResult?.usage).toEqual({ inputTokens: 5, outputTokens: 5 });
+      expect(reviewResult?.usage).toEqual({ inputTokens: 7, outputTokens: 7 });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

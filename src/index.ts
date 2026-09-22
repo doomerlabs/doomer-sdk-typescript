@@ -7,8 +7,10 @@ import {
   type ModelConcernResult,
   type ModelReviewBudget,
   ModelReviewError,
+  type ModelReviewValidation,
   type ReviewModel,
   createModelFromEnvironment,
+  reviewWithValidation,
   unavailableModel,
 } from "./model.js";
 import { type OutcomeContext, outcomeContextFromEnvironment } from "./outcome-context.js";
@@ -2133,7 +2135,7 @@ export function enhanceReviewModel(
   return {
     review: (request) =>
       request.tools?.repository === undefined
-        ? model.review(request)
+        ? reviewWithValidation(model, request)
         : reviewWithRepositoryTools(model, repositoryRoot, request, change),
     concern: (request) => rewriteOpinionConcern(model, request),
   };
