@@ -9,6 +9,7 @@ export type RepositoryReadReason =
   | "unsafe_path"
   | "invalid_range"
   | "range_past_eof"
+  | "per_read_byte_limit"
   | "binary_file"
   | "change_context_missing"
   | "file_not_changed"

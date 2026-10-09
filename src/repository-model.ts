@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { lstat, readdir, realpath } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
@@ -55,6 +55,8 @@ const defaultExcludedSegments = new Set([
 ]);
 
 export interface ModelRepositoryToolOptions {
+  /** Batch scope: a nonempty subset of the runner's changed paths. Dependency reads remain available. */
+  changedFiles?: readonly string[];
   /** Emit bounded file-reading diagnostics without source contents or raw errors. */
   readDiagnostics?: boolean;
   /** File globs the model may read. Empty means every regular non-excluded file. */
@@ -92,6 +94,13 @@ export interface ModelRepositoryCoverage {
 }
 
 export interface ModelRepositoryRetrieval {
+  /** Effective limits, so a partial review can explain which budget was reached. */
+  limits?: {
+    maxRounds: number;
+    maxToolCalls: number;
+    maxTotalBytes: number;
+    maxBytesPerRead: number;
+  };
   /** Correlates source reads and missing-line diagnostics for this retrieval. */
   readingId?: string;
   rounds: number;
@@ -187,11 +196,14 @@ interface ChangeToolResult {
   baseRef: string;
   headRef: string;
   content: string;
+  cursor: number;
+  nextCursor: number;
   truncated: boolean;
   stopReason: string;
 }
 
 interface ErrorToolResult {
+  reason?: string;
   tool: "list_directory" | "read_file" | "read_change";
   path: string;
   error: string;
@@ -227,7 +239,8 @@ const repositoryPlanSchema: Record<string, unknown> = {
           path: { type: "string" },
           cursor: {
             type: "integer",
-            description: "For list_directory, the zero-based entry cursor; otherwise 0.",
+            description:
+              "For list_directory or read_change, use 0 initially and nextCursor for continuation; otherwise 0.",
           },
           startLine: {
             type: "integer",
@@ -247,9 +260,10 @@ export async function reviewWithRepositoryTools<T>(
   model: ReviewModel,
   repositoryRoot: string | undefined,
   request: ModelReviewRequest,
-  change?: ModelRepositoryChange | null,
+  runnerChange?: ModelRepositoryChange | null,
   reviewer?: string,
 ): Promise<ModelReviewResult<T>> {
+  let change = runnerChange;
   if (repositoryRoot === undefined || repositoryRoot.trim() === "") {
     throw new ModelReviewError("Repository model tools require a rule-context repository root.", {
       code: "invalid_model_request",
@@ -257,6 +271,22 @@ export async function reviewWithRepositoryTools<T>(
   }
   const options = request.tools?.repository;
   if (options === undefined) return model.review<T>(request);
+  if (options.changedFiles !== undefined) {
+    if (
+      !change ||
+      !Array.isArray(options.changedFiles) ||
+      options.changedFiles.length === 0 ||
+      options.changedFiles.length > 500 ||
+      options.changedFiles.some((path) => !change?.changedFiles.includes(path)) ||
+      new Set(options.changedFiles).size !== options.changedFiles.length
+    ) {
+      throw new ModelReviewError(
+        "tools.repository.changedFiles must be a nonempty, unique subset of the runner's changed files (at most 500).",
+        { code: "invalid_model_request" },
+      );
+    }
+    change = { ...change, changedFiles: [...options.changedFiles] };
+  }
   const budget = normalizeToolBudget(options);
   const include = compilePatterns(options.include ?? [], "tools.repository.include");
   const exclude = compilePatterns(options.exclude ?? [], "tools.repository.exclude");
@@ -291,6 +321,7 @@ export async function reviewWithRepositoryTools<T>(
   let filesRead = 0;
   let directoriesListed = 0;
   let exhausted = false;
+  let byteLimitReached = false;
   let ready = false;
   let sourceReadRecoveries = 0;
   let usage: ModelReviewUsage = {};
@@ -381,6 +412,7 @@ export async function reviewWithRepositoryTools<T>(
         discardedChanges.add(normalizeRepositoryPath(result.path) ?? result.path);
       }
       exhausted = true;
+      byteLimitReached = true;
       diagnostics.emit(
         {
           ...resultDetails,
@@ -537,8 +569,24 @@ export async function reviewWithRepositoryTools<T>(
           reasons: [
             ...new Set([
               ...changedCoverage.reasons,
+              ...(!changedCoverage.complete &&
+              toolResults.some(
+                (result) => "reason" in result && result.reason === "per_read_byte_limit",
+              )
+                ? ["source_line_byte_limit"]
+                : []),
               ...(omittedChangedFiles > 0 ? ["changed_files_omitted"] : []),
               ...(!changedCoverage.complete && exhausted ? ["retrieval_budget_exhausted"] : []),
+              ...(!changedCoverage.complete && toolCalls >= budget.maxToolCalls
+                ? ["tool_call_limit"]
+                : []),
+              ...(!changedCoverage.complete &&
+              (totalBytes >= budget.maxTotalBytes || byteLimitReached)
+                ? ["total_byte_limit"]
+                : []),
+              ...(!changedCoverage.complete && rounds >= budget.maxRounds
+                ? ["planning_round_limit"]
+                : []),
             ]),
           ],
         }
@@ -567,6 +615,12 @@ export async function reviewWithRepositoryTools<T>(
     citations.map((citation) => Object.freeze({ ...citation })),
   );
   const retrieval: ModelRepositoryRetrieval = {
+    limits: {
+      maxRounds: budget.maxRounds,
+      maxToolCalls: budget.maxToolCalls,
+      maxTotalBytes: budget.maxTotalBytes,
+      maxBytesPerRead: budget.maxBytesPerRead,
+    },
     ...(options.readDiagnostics === true ? { readingId: diagnostics.readingId } : {}),
     rounds,
     toolCalls,
@@ -662,6 +716,7 @@ async function readRepositoryOperation(
       result: {
         tool: operation.tool,
         path: operation.path,
+        reason: readErrorReason(error),
         error: error instanceof Error ? error.message : String(error),
       },
       failureReason: readErrorReason(error),
@@ -731,33 +786,25 @@ function sourceRecoveryOperations(
   );
   if (paths.size === 0) return empty;
   for (const path of paths) {
-    const patch = results.find(
-      (result): result is ChangeToolResult =>
-        result.tool === "read_change" && result.path === path && "content" in result,
-    );
-    if (!patch) {
+    const patch = joinedChange(results, path);
+    if (!patch.complete) {
       complete = false;
       reasons.add(
-        results.some(
-          (result) => result.tool === "read_change" && result.path === path && "error" in result,
-        )
+        patch.failed
           ? "patch_read_failed"
-          : "patch_not_read",
+          : patch.cursor === 0
+            ? "patch_not_read"
+            : "patch_truncated",
       );
       const operation: RepositoryOperation = {
         tool: "read_change",
         path,
-        cursor: 0,
+        cursor: patch.cursor,
         startLine: 0,
         endLine: 0,
       };
       if (operations.length < MAX_OPERATIONS_PER_ROUND && !completed.has(operationKey(operation)))
         operations.push(operation);
-      continue;
-    }
-    if (patch.truncated) {
-      complete = false;
-      reasons.add("patch_truncated");
       continue;
     }
     availablePatches++;
@@ -855,7 +902,7 @@ ${prompt}
 RETRIEVAL RULES:
 - list_directory reveals one deterministic, paginated directory page. Use cursor=0 initially and nextCursor from a prior result for another page. Set startLine=0 and endLine=0.
 - read_file retrieves an inclusive 1-based line range and creates an immutable citation. Set cursor=0.
-- read_change retrieves the patch for one path in change_summary. Set cursor=0, startLine=0, and endLine=0. Use it before judging changed behavior. It is navigation evidence, not a source citation; cite exact lines from a subsequent read_file.
+- read_change retrieves one UTF-8 page of the patch for one path in change_summary. Use cursor=0 initially, then nextCursor until -1; set startLine=0 and endLine=0. A page with truncated=true is incomplete until all contiguous pages are read. Use it before judging changed behavior. It is navigation evidence, not a source citation; cite exact lines from a subsequent read_file.
 - Inspect implementation and relevant tests before setting ready=true.
 - Traverse only directories relevant to the requested review; do not inventory the entire repository.
 - Prefer focused line ranges around important behavior over whole files.
@@ -1093,6 +1140,11 @@ async function executeReadFile(
     stream.destroy();
   }
   if (selected.length === 0) {
+    if (stopReason === "per_read_byte_limit")
+      throw new RepositoryReadError(
+        "per_read_byte_limit",
+        "read_file source line exceeds the per-read byte limit",
+      );
     throw new RepositoryReadError(
       "range_past_eof",
       `read_file line ${operation.startLine} is beyond the available text`,
@@ -1143,72 +1195,161 @@ async function executeReadChange(
   const baseRef = validRevision(change.baseRef);
   const headRef = change.worktree ? "WORKTREE" : validRevision(change.headRef ?? "");
   const revisions = change.worktree ? [baseRef] : [baseRef, headRef];
-  let { stdout } = await execFileAsync(
-    "git",
-    [
+  if (!Number.isSafeInteger(operation.cursor) || operation.cursor < 0) {
+    throw new Error("read_change cursor must be a non-negative safe integer");
+  }
+  const args = [
+    "--literal-pathspecs",
+    "-C",
+    root,
+    "--no-pager",
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--unified=40",
+    "--find-renames",
+    ...revisions,
+    "--",
+    relativePath,
+  ];
+  let page = await readPatchPage(args, operation.cursor, budget.maxBytesPerRead);
+  if (change.worktree && page.totalBytes === 0) {
+    const { stdout: tracked } = await execFileAsync("git", [
       "-C",
       root,
-      "--no-pager",
-      "diff",
-      "--no-ext-diff",
-      "--unified=40",
-      "--find-renames",
-      ...revisions,
+      "ls-files",
       "--",
       relativePath,
-    ],
-    { encoding: "utf8", maxBuffer: Math.max(budget.maxBytesPerRead * 4, 1 << 20) },
-  );
-  if (change.worktree && stdout === "") {
-    // git diff omits untracked files. Capture a new-file patch without changing the index.
-    const { stdout: tracked } = await execFileAsync(
-      "git",
-      ["-C", root, "ls-files", "--", relativePath],
-      { encoding: "utf8" },
-    );
-    if (tracked === "") {
-      try {
-        const result = await execFileAsync(
-          "git",
-          [
-            "-C",
-            root,
-            "--no-pager",
-            "diff",
-            "--no-index",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--unified=40",
-            "--",
-            "/dev/null",
-            relativePath,
-          ],
-          { encoding: "utf8", maxBuffer: Math.max(budget.maxBytesPerRead * 4, 1 << 20) },
-        );
-        stdout = result.stdout;
-      } catch (error) {
-        const result = error as { code?: number; stdout?: string };
-        if (result.code !== 1 || typeof result.stdout !== "string") throw error;
-        stdout = result.stdout;
-      }
-    }
+    ]);
+    if (tracked === "")
+      page = await readPatchPage(
+        [
+          "-C",
+          root,
+          "--no-pager",
+          "diff",
+          "--no-index",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--unified=40",
+          "--",
+          "/dev/null",
+          relativePath,
+        ],
+        operation.cursor,
+        budget.maxBytesPerRead,
+        true,
+      );
   }
-  const encoded = Buffer.from(stdout, "utf8");
-  const truncated = encoded.byteLength > budget.maxBytesPerRead;
-  const content = truncated
-    ? new TextDecoder().decode(encoded.subarray(0, budget.maxBytesPerRead))
-    : stdout;
+  if (
+    operation.cursor > page.totalBytes ||
+    (page.totalBytes > 0 && operation.cursor === page.totalBytes)
+  )
+    throw new Error("read_change cursor is outside the patch");
+  const truncated = page.nextCursor !== -1;
   const result: ChangeToolResult = {
     tool: "read_change",
     path: relativePath,
     baseRef,
     headRef,
-    content,
+    cursor: operation.cursor,
+    nextCursor: page.nextCursor,
+    content: page.content,
     truncated,
     stopReason: truncated ? "per_read_byte_limit" : "patch_complete",
   };
   Object.defineProperty(result, "stopReason", { enumerable: false });
   return result;
+}
+
+// Stream the diff: large patches must not hit execFile's whole-output buffer limit.
+// Retain only a page and UTF-8 boundary lookahead; bound execution and total scanned bytes.
+async function readPatchPage(
+  args: string[],
+  cursor: number,
+  maximum: number,
+  noIndex = false,
+): Promise<{ content: string; nextCursor: number; totalBytes: number }> {
+  const child = spawn("git", args, { stdio: ["ignore", "pipe", "ignore"] });
+  const page = Buffer.alloc(maximum + 4);
+  let retained = 0;
+  let totalBytes = 0;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill();
+  }, 30_000);
+  const completion = new Promise<void>((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) =>
+      code === 0 || (noIndex && code === 1)
+        ? resolve()
+        : reject(new Error("Git patch read failed")),
+    );
+  });
+  // Attach immediately: a failed child must never produce an unhandled rejection.
+  void completion.catch(() => {});
+  try {
+    for await (const chunk of child.stdout) {
+      const buffer = chunk as Buffer;
+      const offset = Math.max(0, cursor - totalBytes);
+      if (offset < buffer.length && retained < page.length)
+        retained += buffer.copy(
+          page,
+          retained,
+          offset,
+          Math.min(buffer.length, offset + page.length - retained),
+        );
+      totalBytes += buffer.length;
+      if (totalBytes > 64 << 20) {
+        child.kill();
+        throw new Error("Git patch exceeds the bounded scan limit");
+      }
+    }
+    await completion;
+    if (timedOut) throw new Error("Git patch read timed out");
+    let end = Math.min(maximum, retained);
+    // A byte cursor always continues at a complete UTF-8 code point.
+    if (cursor > 0 && retained > 0 && (page[0] & 0xc0) === 0x80)
+      throw new Error("read_change cursor splits a UTF-8 code point");
+    if (end < retained) while (end > 0 && (page[end] & 0xc0) === 0x80) end--;
+    return {
+      content: page.subarray(0, end).toString("utf8"),
+      nextCursor: cursor + end < totalBytes ? cursor + end : -1,
+      totalBytes,
+    };
+  } finally {
+    clearTimeout(timer);
+    if (child.exitCode === null) child.kill();
+  }
+}
+
+// Only a contiguous chain from byte zero through the terminal page proves coverage.
+function joinedChange(
+  results: readonly RepositoryToolResult[],
+  path: string,
+): { content: string; complete: boolean; cursor: number; failed: boolean } {
+  let cursor = 0;
+  const contents: string[] = [];
+  const pages = results.filter(
+    (r): r is ChangeToolResult => r.tool === "read_change" && r.path === path && "content" in r,
+  );
+  for (let index = 0; index < pages.length; index++) {
+    const page = pages.find((r) => r.cursor === cursor);
+    if (!page) break;
+    contents.push(page.content);
+    if (page.nextCursor === -1 && !page.truncated)
+      return { content: contents.join(""), complete: true, cursor, failed: false };
+    if (page.nextCursor !== cursor + Buffer.byteLength(page.content) || page.nextCursor <= cursor)
+      break;
+    cursor = page.nextCursor;
+  }
+  return {
+    content: contents.join(""),
+    complete: false,
+    cursor,
+    failed: results.some((r) => r.tool === "read_change" && r.path === path && "error" in r),
+  };
 }
 
 function reportMissingReads(
@@ -1235,21 +1376,17 @@ function reportMissingReads(
       gap("excluded_file");
       continue;
     }
-    const patch = results.find(
-      (r): r is ChangeToolResult => r.tool === "read_change" && r.path === path && "content" in r,
-    );
-    if (!patch) {
+    const patch = joinedChange(results, path);
+    if (!patch.complete) {
       gap(
-        results.some((r) => r.tool === "read_change" && r.path === path && "error" in r)
+        patch.failed
           ? "patch_read_failed"
-          : discardedChanges.has(normalizeRepositoryPath(path) ?? path)
-            ? "patch_discarded_byte_limit"
-            : "patch_not_requested",
+          : patch.cursor > 0
+            ? "patch_truncated"
+            : discardedChanges.has(normalizeRepositoryPath(path) ?? path)
+              ? "patch_discarded_byte_limit"
+              : "patch_not_requested",
       );
-      continue;
-    }
-    if (patch.truncated) {
-      gap("patch_truncated");
       continue;
     }
     const sources = results.filter(
@@ -1373,7 +1510,7 @@ function operationKey(operation: RepositoryOperation): string {
   return operation.tool === "list_directory"
     ? `${operation.tool}:${operation.path}:${operation.cursor}`
     : operation.tool === "read_change"
-      ? `${operation.tool}:${operation.path}`
+      ? `${operation.tool}:${operation.path}:${operation.cursor}`
       : `${operation.tool}:${operation.path}:${operation.startLine}:${operation.endLine}`;
 }
 

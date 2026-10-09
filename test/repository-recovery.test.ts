@@ -735,7 +735,7 @@ it("retains valid source when another changed file is unavailable", async () => 
   });
 });
 
-it("treats a truncated patch as a coverage gap without retrying the final review", async () => {
+it("paginates the patch but keeps oversized source lines partial without retrying the final review", async () => {
   const { result, finalCalls } = await fixture(
     undefined,
     { maxBytesPerRead: 1024 },
@@ -746,7 +746,7 @@ it("treats a truncated patch as a coverage gap without retrying the final review
   expect(result.citations).toEqual([]);
   expect(result.retrieval?.coverage).toMatchObject({
     status: "partial",
-    reasons: ["patch_truncated"],
+    reasons: ["source_window_not_covered", "source_line_byte_limit"],
   });
 });
 
@@ -847,4 +847,77 @@ it("classifies repository planning separately from the final review", async () =
         : "model_review",
     );
   }
+});
+
+it("recovers every UTF-8 patch page before checking hunks, including headers split across pages", async () => {
+  const source = Array.from(
+    { length: 600 },
+    (_, i) => `export const value_${i} = '😀 changed ${i}';\n`,
+  ).join("");
+  const base = source.replaceAll("changed", "original");
+  const { result, requests } = await fixture(
+    undefined,
+    { maxBytesPerRead: 4096, maxToolCalls: 128, maxTotalBytes: 640000 },
+    undefined,
+    source,
+    base,
+  );
+  expect(result.retrieval?.coverage?.status).toBe("complete");
+  const results = (
+    requests.at(-1)?.input as {
+      repository: {
+        toolResults: { tool: string; content: string; cursor: number; nextCursor: number }[];
+      };
+    }
+  ).repository.toolResults;
+  const pages = results.filter((r) => r.tool === "read_change");
+  expect(pages.length).toBeGreaterThan(2);
+  expect(pages[0].cursor).toBe(0);
+  expect(pages.at(-1)?.nextCursor).toBe(-1);
+  for (let i = 1; i < pages.length; i++) expect(pages[i].cursor).toBe(pages[i - 1].nextCursor);
+  const patch = pages.map((r) => r.content).join("");
+  expect(patch).not.toContain("�");
+  expect(patch).toContain("😀 changed 599");
+  expect(result.citations?.some((r) => r.endLine === 600)).toBe(true);
+});
+
+it("a missing terminal patch page stays partial and names the call budget", async () => {
+  const { result } = await fixture(
+    undefined,
+    { maxBytesPerRead: 1024, maxToolCalls: 1 },
+    undefined,
+    "long line".repeat(1000),
+  );
+  expect(result.retrieval?.coverage).toMatchObject({
+    status: "partial",
+    reasons: expect.arrayContaining(["patch_truncated", "tool_call_limit"]),
+  });
+  expect(result.retrieval?.limits?.maxToolCalls).toBe(1);
+});
+
+it("scopes a batch to runner-supplied paths without counting other batches as omitted", async () => {
+  const { result, requests } = await fixture(["source.ts", "other.ts"], {
+    changedFiles: ["source.ts"],
+  });
+  expect(result.retrieval?.coverage).toMatchObject({
+    status: "complete",
+    changedFiles: 1,
+    omittedChangedFiles: 0,
+  });
+  const input = requests.at(-1)?.input as {
+    repository: { toolResults: { tool: string; changedFiles: string[] }[] };
+  };
+  expect(
+    input.repository.toolResults.find((r) => r.tool === "change_summary")?.changedFiles,
+  ).toEqual(["source.ts"]);
+});
+
+it.each([
+  { changedFiles: [] },
+  { changedFiles: ["outside.ts"] },
+  { changedFiles: ["source.ts", "source.ts"] },
+])("rejects invalid batch scope %j", async ({ changedFiles }) => {
+  await expect(fixture(undefined, { changedFiles })).rejects.toMatchObject({
+    code: "invalid_model_request",
+  });
 });
