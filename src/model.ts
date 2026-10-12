@@ -459,7 +459,7 @@ export async function reviewWithValidation<T>(
   for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
     const elapsed = Date.now() - startedAt;
     const remainingTimeoutMs = timeoutMs - elapsed;
-    if (remainingTimeoutMs <= 0) throw modelTimeoutError(timeoutMs);
+    if (remainingTimeoutMs <= 0) throw exhaustedModelRecovery(attempt - 1, "deadline");
     const result = decorate(
       await model.review<T>({
         ...baseRequest,

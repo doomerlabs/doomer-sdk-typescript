@@ -1103,6 +1103,9 @@ subprocess runners can distinguish exhausted request recovery from a fresh trans
 failure. Diagnostics report the attempt count and whether the deadline or attempt
 limit ended recovery; upstream error bodies are not copied into the terminal message.
 Per-attempt timing events retain the original failure classification.
+Validation retries also return this terminal marker when their shared deadline is
+exhausted before another generation attempt; diagnostics count completed generation
+attempts. Exhausting validation attempts still returns `model_validation_failed`.
 
 Runners should avoid replaying the entire reviewer for this terminal error. A required
 request still fails the review; exhaustion does not produce a clean opinion or discard

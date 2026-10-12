@@ -17,6 +17,7 @@ import {
   enhanceReviewModel,
   unavailableModel,
 } from "../src/index.js";
+import { reviewWithValidation } from "../src/model.js";
 
 const servers: ReturnType<typeof createServer>[] = [];
 
@@ -425,6 +426,44 @@ describe("model review capability", () => {
       retryable: false,
     });
   });
+
+  it.each([1, 2])(
+    "marks the shared validation deadline as terminal after %i completed attempts",
+    async (attempts) => {
+      let now = 1_000;
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+      const budgets: number[] = [];
+      const model: ReviewModel = {
+        async review<T>(request: ModelReviewRequest<T>) {
+          budgets.push(request.budget?.timeoutMs ?? 0);
+          return { output: {} as T, provider: "fixture", model: "reviewer" };
+        },
+      };
+      try {
+        const result = reviewWithValidation(model, {
+          prompt: "Private prompt",
+          input: {},
+          schema: { type: "object" },
+          budget: { timeoutMs: attempts * 50 },
+          validation: {
+            validate: () => {
+              now += 50;
+              throw new Error("Private validator feedback");
+            },
+          },
+        });
+        await expect(result).rejects.toMatchObject({
+          code: "model_request_recovery_exhausted",
+          retryable: false,
+          diagnostics: { attempts, reason: "deadline" },
+          message: `model_request_recovery_exhausted: Model request recovery exhausted after ${attempts} attempt(s) (deadline).`,
+        });
+        expect(budgets).toEqual(attempts === 1 ? [50] : [100, 50]);
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
 
   it("fails explicitly when an adversary requests an unavailable model", async () => {
     await expect(
