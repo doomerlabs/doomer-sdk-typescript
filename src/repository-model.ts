@@ -1172,7 +1172,7 @@ async function executeReadChange(
     // git diff omits untracked files. Capture a new-file patch without changing the index.
     const { stdout: tracked } = await execFileAsync(
       "git",
-      ["-C", root, "ls-files", "--", relativePath],
+      ["-C", root, "--literal-pathspecs", "ls-files", "--", relativePath],
       { encoding: "utf8" },
     );
     if (tracked === "") {

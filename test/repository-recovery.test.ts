@@ -505,6 +505,65 @@ it.each([{ exclude: ["**/*.ts"] }, { include: ["**/*.go"] }])(
   },
 );
 
+it.each([
+  { path: "draft[1].ts", trackedPath: "draft1.ts" },
+  { path: "routes/[id]/page.ts", trackedPath: "routes/i/page.ts" },
+  { path: ":(glob)*.ts", trackedPath: "draft1.ts" },
+])("reads untracked $path despite a matching tracked pathspec", async ({ path, trackedPath }) => {
+  const root = await mkdtemp(join(tmpdir(), "sdk-literal-untracked-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-C", root, "--literal-pathspecs", ...args], { encoding: "utf8" }).trim();
+  const requests: ModelReviewRequest[] = [];
+  const model: ReviewModel = {
+    async review<T>(request: ModelReviewRequest) {
+      requests.push(request);
+      return {
+        output: (request.prompt.startsWith("REPOSITORY RETRIEVAL CONTROLLER:")
+          ? { ready: true, operations: [] }
+          : { findings: [] }) as T,
+      };
+    },
+  };
+  try {
+    git("init", "-q");
+    await mkdir(join(root, trackedPath, ".."), { recursive: true });
+    await writeFile(join(root, trackedPath), "export const tracked = true;\n");
+    git("add", "--", trackedPath);
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "-qm", "base");
+    await mkdir(join(root, path, ".."), { recursive: true });
+    await writeFile(join(root, path), "export const added = true;\n");
+    const indexBefore = git("ls-files", "--stage");
+    const result = await reviewWithRepositoryTools(
+      model,
+      root,
+      { prompt: "Review", input: {}, schema: { type: "object" }, tools: { repository: {} } },
+      { baseRef: "HEAD", changedFiles: [path], worktree: true },
+    );
+    expect(result.retrieval?.coverage).toMatchObject({ status: "complete", reasons: [] });
+    expect(result.citations).toContainEqual(
+      expect.objectContaining({ path, content: "export const added = true;" }),
+    );
+    const input = requests.at(-1)?.input as {
+      repository: { toolResults: Array<{ tool: string; path?: string; content?: string }> };
+    };
+    expect(input.repository.toolResults).toContainEqual(
+      expect.objectContaining({
+        tool: "read_change",
+        path,
+        content: expect.stringContaining("+export const added = true;"),
+      }),
+    );
+    expect(
+      input.repository.toolResults.every(
+        (result) => !result.content?.includes("export const tracked"),
+      ),
+    ).toBe(true);
+    expect(git("ls-files", "--stage")).toBe(indexBefore);
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
 it("captures untracked worktree text without changing the index", async () => {
   const { result } = await fixture(
     undefined,
