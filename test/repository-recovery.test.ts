@@ -750,8 +750,8 @@ it("treats a truncated patch as a coverage gap without retrying the final review
   });
 });
 
-it("finishes when a changed file was deleted without inventing a head citation", async () => {
-  const { result, finalCalls } = await fixture(
+it("reads a deleted file's patch without inventing a head citation", async () => {
+  const { result, finalCalls, requests } = await fixture(
     undefined,
     {},
     undefined,
@@ -766,9 +766,134 @@ it("finishes when a changed file was deleted without inventing a head citation",
   expect(finalCalls).toBe(1);
   expect(result.citations).toEqual([]);
   expect(result.retrieval?.coverage).toMatchObject({
-    status: "partial",
-    reasons: ["patch_read_failed"],
+    status: "complete",
+    reasons: [],
   });
+  expect(result.retrieval?.changedHunksCovered).toBe(true);
+  const repository = requests.at(-1)?.input as {
+    repository: { toolResults: Array<{ tool: string; content?: string }> };
+  };
+  expect(repository.repository.toolResults).toContainEqual(
+    expect.objectContaining({
+      tool: "read_change",
+      content: expect.stringContaining("deleted file mode"),
+    }),
+  );
+});
+
+it.each(["worktree", "committed", "removed directory", "renamed"])(
+  "retrieves removed paths from Git for a %s change",
+  async (changeKind) => {
+    const root = await mkdtemp(join(tmpdir(), "sdk-deleted-patch-"));
+    const path = "src/removed.ts";
+    const requests: ModelReviewRequest[] = [];
+    const git = (...args: string[]) =>
+      execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim();
+    const commit = (message: string) =>
+      git(
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.com",
+        "commit",
+        "-qm",
+        message,
+      );
+    const model: ReviewModel = {
+      async review<T>(request: ModelReviewRequest) {
+        requests.push(request);
+        return {
+          output: (request.prompt.startsWith("REPOSITORY RETRIEVAL CONTROLLER:")
+            ? { ready: true, operations: [] }
+            : { findings: [] }) as T,
+        };
+      },
+    };
+    try {
+      git("init", "-q");
+      await mkdir(join(root, "src"));
+      await writeFile(join(root, path), "export const removed = true;\n");
+      git("add", path);
+      commit("base");
+      const baseRef = git("rev-parse", "HEAD");
+      if (changeKind === "renamed") git("mv", path, "src/renamed.ts");
+      else if (changeKind === "removed directory") await rm(join(root, "src"), { recursive: true });
+      else await rm(join(root, path));
+      if (changeKind === "committed" || changeKind === "renamed") {
+        git("add", "-A");
+        commit("remove original path");
+      }
+      const indexBefore = git("ls-files", "--stage");
+      const result = await reviewWithRepositoryTools(
+        model,
+        root,
+        { prompt: "Review", input: {}, schema: { type: "object" }, tools: { repository: {} } },
+        {
+          baseRef,
+          headRef: "HEAD",
+          changedFiles: [path],
+          worktree: changeKind !== "committed" && changeKind !== "renamed",
+        },
+      );
+      expect(result.retrieval?.coverage).toMatchObject({ status: "complete", reasons: [] });
+      expect(result.citations).toEqual([]);
+      const final = requests.filter(
+        (request) => !request.prompt.startsWith("REPOSITORY RETRIEVAL CONTROLLER:"),
+      );
+      expect(final).toHaveLength(1);
+      const input = final[0].input as {
+        repository: { toolResults: Array<{ tool: string; path?: string; content?: string }> };
+      };
+      expect(input.repository.toolResults).toContainEqual(
+        expect.objectContaining({
+          tool: "read_change",
+          path,
+          content: expect.stringContaining("-export const removed = true;"),
+        }),
+      );
+      expect(git("ls-files", "--stage")).toBe(indexBefore);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+it("rejects a missing changed file under a symlink outside the repository", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sdk-deleted-link-"));
+  const outside = await mkdtemp(join(tmpdir(), "sdk-deleted-outside-"));
+  const requests: ModelReviewRequest[] = [];
+  const model: ReviewModel = {
+    async review<T>(request: ModelReviewRequest) {
+      requests.push(request);
+      return {
+        output: (request.prompt.startsWith("REPOSITORY RETRIEVAL CONTROLLER:")
+          ? { ready: true, operations: [] }
+          : {}) as T,
+      };
+    },
+  };
+  try {
+    execFileSync("git", ["-C", root, "init", "-q"]);
+    await symlink(outside, join(root, "linked"));
+    const result = await reviewWithRepositoryTools(
+      model,
+      root,
+      { prompt: "Review", input: {}, schema: { type: "object" }, tools: { repository: {} } },
+      { baseRef: "HEAD", changedFiles: ["linked/missing.ts"], worktree: true },
+    );
+    expect(result.retrieval?.coverage?.status).toBe("partial");
+    const input = requests.at(-1)?.input as { repository: { toolResults: unknown[] } };
+    expect(input.repository.toolResults).toContainEqual(
+      expect.objectContaining({
+        tool: "read_change",
+        path: "linked/missing.ts",
+        error: expect.stringContaining("symbolic link"),
+      }),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
 });
 
 it("reports byte exhaustion when initial context fills the budget before any preload", async () => {
