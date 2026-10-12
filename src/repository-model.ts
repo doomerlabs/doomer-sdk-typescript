@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { createReadStream } from "node:fs";
+import { type Stats, createReadStream } from "node:fs";
 import { lstat, readdir, realpath } from "node:fs/promises";
-import { relative, resolve, sep } from "node:path";
+import { dirname, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import {
@@ -1127,7 +1127,9 @@ async function executeReadChange(
       "read_change requires a runner-provided change context",
     );
   }
-  const { relativePath } = await secureRepositoryPath(root, operation.path, "file");
+  // Patches remain available in Git after a file (or its directory) is deleted.
+  // Keep path and symlink checks, but do not require head source for read_change.
+  const { relativePath } = await secureRepositoryPath(root, operation.path, "file", true);
   if (!change.changedFiles.includes(relativePath)) {
     throw new RepositoryReadError(
       "file_not_changed",
@@ -1149,8 +1151,10 @@ async function executeReadChange(
       "-C",
       root,
       "--no-pager",
+      "--literal-pathspecs",
       "diff",
       "--no-ext-diff",
+      "--no-textconv",
       "--unified=40",
       "--find-renames",
       ...revisions,
@@ -1159,11 +1163,16 @@ async function executeReadChange(
     ],
     { encoding: "utf8", maxBuffer: Math.max(budget.maxBytesPerRead * 4, 1 << 20) },
   );
+  if (stdout === "") {
+    // An absent path with no Git patch is still a missing file, not a deletion.
+    // Only an existing file can supply the untracked-file fallback below.
+    await secureRepositoryPath(root, operation.path, "file");
+  }
   if (change.worktree && stdout === "") {
     // git diff omits untracked files. Capture a new-file patch without changing the index.
     const { stdout: tracked } = await execFileAsync(
       "git",
-      ["-C", root, "ls-files", "--", relativePath],
+      ["-C", root, "--literal-pathspecs", "ls-files", "--", relativePath],
       { encoding: "utf8" },
     );
     if (tracked === "") {
@@ -1305,6 +1314,7 @@ async function secureRepositoryPath(
   root: string,
   requestedPath: string,
   kind: "directory" | "file",
+  allowMissing = false,
 ): Promise<{ absolute: string; relativePath: string }> {
   const normalized = normalizeRepositoryPath(requestedPath);
   if (normalized === undefined) {
@@ -1316,20 +1326,47 @@ async function secureRepositoryPath(
   const candidate = resolve(root, normalized);
   if (!isWithinRoot(root, candidate))
     throw new RepositoryReadError("unsafe_path", `${kind} path escapes the repository root`);
-  const info = await lstat(candidate);
+  const { path: existing, info } = await nearestExistingRepositoryEntry(
+    root,
+    candidate,
+    allowMissing,
+  );
   if (info.isSymbolicLink())
     throw new RepositoryReadError("symlink_rejected", `${kind} path must not be a symbolic link`);
-  if (kind === "directory" ? !info.isDirectory() : !info.isFile()) {
+  // A historical patch path may lie beneath a directory now replaced by a file.
+  // Its existing ancestor anchors containment; it is not read as head source.
+  const missingPatchPath = allowMissing && existing !== candidate;
+  const hasExpectedType =
+    kind === "directory"
+      ? info.isDirectory()
+      : info.isFile() || (missingPatchPath && info.isDirectory());
+  if (!hasExpectedType) {
     throw new RepositoryReadError(
       "not_regular_file",
       `${kind} path does not identify a regular ${kind}`,
     );
   }
-  const canonical = await realpath(candidate);
+  const canonical = resolve(await realpath(existing), relative(existing, candidate));
   if (!isWithinRoot(root, canonical))
     throw new RepositoryReadError("unsafe_path", `${kind} path escapes the repository root`);
   const relativePath = relative(root, canonical).replaceAll("\\", "/") || ".";
   return { absolute: canonical, relativePath };
+}
+
+async function nearestExistingRepositoryEntry(
+  root: string,
+  path: string,
+  allowMissing: boolean,
+): Promise<{ path: string; info: Stats }> {
+  try {
+    return { path, info: await lstat(path) };
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    const missingPath = code === "ENOENT" || code === "ENOTDIR";
+    if (!allowMissing || !missingPath) throw error;
+    if (path === root) throw error;
+    return nearestExistingRepositoryEntry(root, dirname(path), true);
+  }
 }
 
 function isWithinRoot(root: string, candidate: string): boolean {
