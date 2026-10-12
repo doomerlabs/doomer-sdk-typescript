@@ -1,0 +1,19 @@
+src/model.ts
+  s_6411db762c836b::t_219f7fa8d545d9 288-289,291-292,294-299,337,358-360
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c12e58a94f104a84b7116b755aea3ec07272f992",
+  "prompts": {},
+  "sessions": {
+    "s_6411db762c836b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a12fab-e9c3-73d3-9c87-f20215e551e4",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Marc Campbell <marc.e.campbell@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+src/candidate-recovery.ts
+  s_effac2b4965c4d::t_be6711a5e6ce05 136-147
+src/index.ts
+  s_effac2b4965c4d::t_7ac81cebb95f70 1535-1540,1547,1551,1562-1591
+test/candidate-recovery.test.ts
+  s_effac2b4965c4d::t_7c567597c30152 117-147
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "49177fcbac3be06dbea6d75b553d1bc79884b468",
+  "prompts": {},
+  "sessions": {
+    "s_effac2b4965c4d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0eed2-c799-7e31-b5ad-bcffd20e23c8",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Marc Campbell <marc.e.campbell@gmail.com>"
+    }
+  }
+}
