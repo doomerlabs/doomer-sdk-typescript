@@ -285,25 +285,18 @@ export class BrokerReviewModel implements ReviewModel {
         if (outcome.ok) return outcome.result;
         const error = outcome.error;
         if (!(error instanceof ModelReviewError) || !error.retryable) throw error;
-        if (controller.signal.aborted || attempt === this.#maximumAttempts) {
-          throw exhaustedModelRecovery(
-            attempt,
-            controller.signal.aborted ? "deadline" : "attempt_limit",
-          );
+        if (controller.signal.aborted) {
+          throw exhaustedModelRecovery(attempt, "deadline");
         }
-        try {
-          await this.#waitForRetry(
-            attempt,
-            controller.signal,
-            normalized.budget.timeoutMs,
-            diagnostics,
-          );
-        } catch (error) {
-          if (error instanceof ModelReviewError && error.retryable) {
-            throw exhaustedModelRecovery(attempt, "deadline");
-          }
-          throw error;
+        if (attempt === this.#maximumAttempts) {
+          throw exhaustedModelRecovery(attempt, "attempt_limit");
         }
+        await this.#waitForRetry(
+          attempt,
+          controller.signal,
+          normalized.budget.timeoutMs,
+          diagnostics,
+        );
       }
       throw exhaustedModelRecovery(this.#maximumAttempts, "attempt_limit");
     } finally {
@@ -341,7 +334,7 @@ export class BrokerReviewModel implements ReviewModel {
     }
   }
 
-  // Keep backoff calculation and its terminal timeout diagnostic together.
+  // Keep backoff, timeout diagnostics, and error translation together.
   async #waitForRetry(
     attempt: number,
     signal: AbortSignal,
@@ -362,6 +355,9 @@ export class BrokerReviewModel implements ReviewModel {
           ? (error.code ?? "model_review_failed")
           : "model_review_failed",
       );
+      if (error instanceof ModelReviewError && error.retryable) {
+        throw exhaustedModelRecovery(attempt, "deadline");
+      }
       throw error;
     }
   }
