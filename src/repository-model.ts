@@ -1333,8 +1333,13 @@ async function secureRepositoryPath(
   );
   if (info.isSymbolicLink())
     throw new RepositoryReadError("symlink_rejected", `${kind} path must not be a symbolic link`);
-  const needsDirectory = kind === "directory" || existing !== candidate;
-  const hasExpectedType = needsDirectory ? info.isDirectory() : info.isFile();
+  // A historical patch path may lie beneath a directory now replaced by a file.
+  // Its existing ancestor anchors containment; it is not read as head source.
+  const missingPatchPath = allowMissing && existing !== candidate;
+  const hasExpectedType =
+    kind === "directory"
+      ? info.isDirectory()
+      : info.isFile() || (missingPatchPath && info.isDirectory());
   if (!hasExpectedType) {
     throw new RepositoryReadError(
       "not_regular_file",
@@ -1356,7 +1361,9 @@ async function nearestExistingRepositoryEntry(
   try {
     return { path, info: await lstat(path) };
   } catch (error) {
-    if (!allowMissing || (error as { code?: string }).code !== "ENOENT") throw error;
+    const code = (error as { code?: string }).code;
+    const missingPath = code === "ENOENT" || code === "ENOTDIR";
+    if (!allowMissing || !missingPath) throw error;
     if (path === root) throw error;
     return nearestExistingRepositoryEntry(root, dirname(path), true);
   }
