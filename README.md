@@ -1095,6 +1095,24 @@ model attempt. Attempt events distinguish `repository_planning` calls from
 The parent broker's provider
 timing remains necessary to locate failures inside inference.
 
+Broker transport retries reuse the same normalized request, including gathered repository
+evidence, under one shared deadline. When retryable failures exhaust that deadline or
+the configured attempt limit, the SDK throws a nonretryable `ModelReviewError` with
+code `model_request_recovery_exhausted`. Its message also includes that marker so
+subprocess runners can distinguish exhausted request recovery from a fresh transient
+failure. Diagnostics report the attempt count and whether the deadline or attempt
+limit ended recovery; upstream error bodies are not copied into the terminal message.
+Per-attempt timing events retain the original failure classification.
+Validation retries also return this terminal marker when their shared deadline is
+exhausted before another generation attempt; diagnostics count completed generation
+attempts. Exhausting validation attempts still returns `model_validation_failed`.
+
+Runners should avoid replaying the entire reviewer for this terminal error. A required
+request still fails the review; exhaustion does not produce a clean opinion or discard
+supported findings. Worker job retry policies remain a separate concern. Permanent
+errors and successful request recovery keep their existing behavior.
+
+
 
 ```typescript
 const review = await ctx.model.review<MyReview>({ /* prompt, schema, repository tools */ });

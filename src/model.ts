@@ -186,6 +186,22 @@ export class ModelReviewError extends Error {
   }
 }
 
+// The message carries the code because subprocess runners may only retain stderr.
+// Never include an upstream error body, prompt, or validator feedback here.
+function exhaustedModelRecovery(
+  attempts: number,
+  reason: "deadline" | "attempt_limit",
+): ModelReviewError {
+  return new ModelReviewError(
+    `model_request_recovery_exhausted: Model request recovery exhausted after ${attempts} attempt(s) (${reason}).`,
+    {
+      code: "model_request_recovery_exhausted",
+      retryable: false,
+      diagnostics: Object.freeze({ attempts, reason }),
+    },
+  );
+}
+
 export function createModelFromEnvironment(
   environment: ModelEnvironment = process.env,
 ): ReviewModel {
@@ -268,13 +284,12 @@ export class BrokerReviewModel implements ReviewModel {
         );
         if (outcome.ok) return outcome.result;
         const error = outcome.error;
-        if (
-          !(error instanceof ModelReviewError) ||
-          !error.retryable ||
-          controller.signal.aborted ||
-          attempt === this.#maximumAttempts
-        ) {
-          throw error;
+        if (!(error instanceof ModelReviewError) || !error.retryable) throw error;
+        if (controller.signal.aborted) {
+          throw exhaustedModelRecovery(attempt, "deadline");
+        }
+        if (attempt === this.#maximumAttempts) {
+          throw exhaustedModelRecovery(attempt, "attempt_limit");
         }
         await this.#waitForRetry(
           attempt,
@@ -283,10 +298,7 @@ export class BrokerReviewModel implements ReviewModel {
           diagnostics,
         );
       }
-      throw new ModelReviewError("Model broker retry loop exhausted unexpectedly.", {
-        code: "broker_unavailable",
-        retryable: true,
-      });
+      throw exhaustedModelRecovery(this.#maximumAttempts, "attempt_limit");
     } finally {
       clearTimeout(timeout);
       // Cleanup must not replace the typed request error or a successful response.
@@ -322,7 +334,7 @@ export class BrokerReviewModel implements ReviewModel {
     }
   }
 
-  // Keep backoff calculation and its terminal timeout diagnostic together.
+  // Keep backoff, timeout diagnostics, and error translation together.
   async #waitForRetry(
     attempt: number,
     signal: AbortSignal,
@@ -343,6 +355,9 @@ export class BrokerReviewModel implements ReviewModel {
           ? (error.code ?? "model_review_failed")
           : "model_review_failed",
       );
+      if (error instanceof ModelReviewError && error.retryable) {
+        throw exhaustedModelRecovery(attempt, "deadline");
+      }
       throw error;
     }
   }
@@ -444,7 +459,7 @@ export async function reviewWithValidation<T>(
   for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
     const elapsed = Date.now() - startedAt;
     const remainingTimeoutMs = timeoutMs - elapsed;
-    if (remainingTimeoutMs <= 0) throw modelTimeoutError(timeoutMs);
+    if (remainingTimeoutMs <= 0) throw exhaustedModelRecovery(attempt - 1, "deadline");
     const result = decorate(
       await model.review<T>({
         ...baseRequest,
