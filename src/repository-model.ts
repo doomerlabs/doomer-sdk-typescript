@@ -1326,21 +1326,16 @@ async function secureRepositoryPath(
   const candidate = resolve(root, normalized);
   if (!isWithinRoot(root, candidate))
     throw new RepositoryReadError("unsafe_path", `${kind} path escapes the repository root`);
-  let existing = candidate;
-  let info: Stats;
-  for (;;) {
-    try {
-      info = await lstat(existing);
-      break;
-    } catch (error) {
-      if (!allowMissing || (error as { code?: string }).code !== "ENOENT" || existing === root)
-        throw error;
-      existing = dirname(existing);
-    }
-  }
+  const { path: existing, info } = await nearestExistingRepositoryEntry(
+    root,
+    candidate,
+    allowMissing,
+  );
   if (info.isSymbolicLink())
     throw new RepositoryReadError("symlink_rejected", `${kind} path must not be a symbolic link`);
-  if (kind === "directory" || existing !== candidate ? !info.isDirectory() : !info.isFile()) {
+  const needsDirectory = kind === "directory" || existing !== candidate;
+  const hasExpectedType = needsDirectory ? info.isDirectory() : info.isFile();
+  if (!hasExpectedType) {
     throw new RepositoryReadError(
       "not_regular_file",
       `${kind} path does not identify a regular ${kind}`,
@@ -1351,6 +1346,20 @@ async function secureRepositoryPath(
     throw new RepositoryReadError("unsafe_path", `${kind} path escapes the repository root`);
   const relativePath = relative(root, canonical).replaceAll("\\", "/") || ".";
   return { absolute: canonical, relativePath };
+}
+
+async function nearestExistingRepositoryEntry(
+  root: string,
+  path: string,
+  allowMissing: boolean,
+): Promise<{ path: string; info: Stats }> {
+  try {
+    return { path, info: await lstat(path) };
+  } catch (error) {
+    if (!allowMissing || (error as { code?: string }).code !== "ENOENT") throw error;
+    if (path === root) throw error;
+    return nearestExistingRepositoryEntry(root, dirname(path), true);
+  }
 }
 
 function isWithinRoot(root: string, candidate: string): boolean {
