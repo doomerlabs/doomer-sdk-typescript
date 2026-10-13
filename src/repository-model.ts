@@ -246,7 +246,7 @@ export async function reviewWithRepositoryTools<T>(
   model: ReviewModel,
   repositoryRoot: string | undefined,
   request: ModelReviewRequest,
-  change?: ModelRepositoryChange | null,
+  runnerChange?: ModelRepositoryChange | null,
   reviewer?: string,
 ): Promise<ModelReviewResult<T>> {
   if (repositoryRoot === undefined || repositoryRoot.trim() === "") {
@@ -256,6 +256,17 @@ export async function reviewWithRepositoryTools<T>(
   }
   const options = request.tools?.repository;
   if (options === undefined) return model.review<T>(request);
+  // Use one canonical change set for filters, reads, coverage, and summaries.
+  // Keep invalid paths so guarded reads report gaps rather than dropping them.
+  const change =
+    runnerChange == null
+      ? runnerChange
+      : {
+          ...runnerChange,
+          changedFiles: runnerChange.changedFiles.map(
+            (path) => normalizeRepositoryPath(path) ?? path,
+          ),
+        };
   const budget = normalizeToolBudget(options);
   const include = compilePatterns(options.include ?? [], "tools.repository.include");
   const exclude = repositoryExclusions(options.exclude ?? [], change);
@@ -1389,10 +1400,8 @@ function repositoryExclusions(
   const changedPaths = new Set<string>();
   const changedDirectories = new Set<string>();
   for (const path of change?.changedFiles ?? []) {
-    const normalized = normalizeRepositoryPath(path);
-    if (normalized === undefined) continue;
-    changedPaths.add(normalized);
-    const segments = normalized.split("/");
+    changedPaths.add(path);
+    const segments = path.split("/");
     for (let index = 1; index < segments.length; index += 1) {
       changedDirectories.add(segments.slice(0, index).join("/"));
     }

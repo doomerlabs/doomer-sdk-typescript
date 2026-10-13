@@ -374,7 +374,13 @@ it("recovers a failed model-selected source window", async () => {
 });
 
 it("keeps missing source, symlinks, and traversal as gaps without reading unsafe files", async () => {
-  for (const path of ["missing.ts", "link.ts", "../secret.ts", "/secret.ts"]) {
+  for (const path of [
+    "missing.ts",
+    "link.ts",
+    "../secret.ts",
+    "/secret.ts",
+    "target/../secret.ts",
+  ]) {
     const { result, finalCalls } = await fixture([path]);
     expect(finalCalls).toBe(1);
     expect(result.citations).toEqual([]);
@@ -411,6 +417,51 @@ it.each([
   expect(result.citations?.[0]).toMatchObject({ path });
   expect(result.citations?.[0].content).toContain("source evidence");
 });
+
+it.each(["./app/target/page.tsx", "app\\target\\page.tsx", " app/target/page.tsx "])(
+  "uses canonical runner path %s for filters, patch reads, and source coverage",
+  async (runnerPath) => {
+    const path = "app/target/page.tsx";
+    const changedFiles = [runnerPath];
+    const { result, requests } = await fixture(
+      changedFiles,
+      { include: ["app/**/*.tsx"] },
+      undefined,
+      undefined,
+      undefined,
+      false,
+      path,
+    );
+    expect(changedFiles).toEqual([runnerPath]);
+    expect(result.retrieval?.coverage).toMatchObject({
+      status: "complete",
+      changedFiles: 1,
+      inScopeChangedFiles: 1,
+      coveredHunkCount: 1,
+    });
+    expect(result.citations?.[0].path).toBe(path);
+    const input = requests.at(-1)?.input as {
+      repository: { toolResults: Array<{ tool: string; path?: string; changedFiles?: string[] }> };
+    };
+    expect(
+      input.repository.toolResults.find((r) => r.tool === "change_summary")?.changedFiles,
+    ).toEqual([path]);
+    expect(
+      input.repository.toolResults.some((r) => r.tool === "read_change" && r.path === path),
+    ).toBe(true);
+    const excluded = await fixture(
+      [runnerPath],
+      { exclude: ["app/target/**"] },
+      undefined,
+      undefined,
+      undefined,
+      false,
+      path,
+    );
+    expect(excluded.result.retrieval?.coverage?.inScopeChangedFiles).toBe(0);
+    expect(excluded.result.citations).toEqual([]);
+  },
+);
 
 it.each([{ exclude: ["**/target/**"] }, { include: ["**/*.go"] }])(
   "preserves explicit filters for changed files under target: %j",
