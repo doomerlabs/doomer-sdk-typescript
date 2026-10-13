@@ -236,13 +236,14 @@ async function fixture(
   baseRef: string | undefined = "HEAD",
   untracked = false,
   deleted = false,
+  extraFiles: Record<string, string> = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "sdk-source-recovery-"));
   try {
     execFileSync("git", ["-C", root, "init", "-q"]);
     await mkdir(join(root, sourcePath, ".."), { recursive: true });
     await writeFile(join(root, sourcePath), baseSource);
-    execFileSync("git", ["-C", root, "add", sourcePath]);
+    execFileSync("git", ["-C", root, "add", "-f", sourcePath]);
     execFileSync("git", [
       "-C",
       root,
@@ -274,6 +275,10 @@ async function fixture(
       ]);
     }
     if (deleted) await rm(join(root, sourcePath));
+    for (const [path, content] of Object.entries(extraFiles)) {
+      await mkdir(join(root, path, ".."), { recursive: true });
+      await writeFile(join(root, path), content);
+    }
     const indexBefore = execFileSync("git", ["-C", root, "ls-files", "--stage"], {
       encoding: "utf8",
     });
@@ -385,6 +390,135 @@ it("recovers only in-scope changed files", async () => {
     exclude: ["**/vendor/**"],
   });
   expect(result.citations?.map((c) => c.path)).toEqual(["source.ts"]);
+});
+
+it.each([
+  "app/target/page.tsx",
+  "build/source.ts",
+  "dist/source.ts",
+  "coverage/source.ts",
+  "node_modules/package/source.ts",
+  ".venv/source.ts",
+])("reads changed %s despite discovery defaults", async (path) => {
+  const { result } = await fixture([path], {}, undefined, undefined, undefined, false, path);
+  expect(result.retrieval?.coverage).toMatchObject({
+    status: "complete",
+    changedFiles: 1,
+    inScopeChangedFiles: 1,
+    hunkCount: 1,
+    coveredHunkCount: 1,
+  });
+  expect(result.citations?.[0]).toMatchObject({ path });
+  expect(result.citations?.[0].content).toContain("source evidence");
+});
+
+it.each([{ exclude: ["**/target/**"] }, { include: ["**/*.go"] }])(
+  "preserves explicit filters for changed files under target: %j",
+  async (options) => {
+    const path = "app/target/page.tsx";
+    const { result } = await fixture([path], options, undefined, undefined, undefined, false, path);
+    expect(result.retrieval?.coverage?.inScopeChangedFiles).toBe(0);
+    expect(result.retrieval?.toolCalls).toBe(0);
+    expect(result.citations).toEqual([]);
+  },
+);
+
+it.each([".git/config", ".hg/config", ".svn/config"])(
+  "never exposes repository metadata supplied as changed: %s",
+  async (path) => {
+    const { result } = await fixture([path]);
+    expect(result.retrieval?.coverage?.inScopeChangedFiles).toBe(0);
+    expect(result.retrieval?.toolCalls).toBe(0);
+  },
+);
+
+it("discovers changed-file ancestors without exposing unchanged siblings", async () => {
+  const path = "target/source.ts";
+  const operation = (tool: string, path: string) => ({
+    tool,
+    path,
+    cursor: 0,
+    startLine: tool === "read_file" ? 1 : 0,
+    endLine: tool === "read_file" ? 1 : 0,
+  });
+  const { result, requests } = await fixture(
+    [path],
+    {},
+    {
+      ready: false,
+      operations: [
+        operation("list_directory", "."),
+        operation("list_directory", "target"),
+        operation("read_file", "target/hidden.ts"),
+      ],
+    },
+    undefined,
+    undefined,
+    false,
+    path,
+    "HEAD",
+    false,
+    false,
+    { "target/hidden.ts": "unchanged sibling", "target/nested/hidden.ts": "hidden subtree" },
+  );
+  expect(result.retrieval?.coverage?.status).toBe("complete");
+  expect(result.citations?.map((citation) => citation.path)).toEqual([path]);
+  const input = requests.at(-1)?.input as {
+    repository: {
+      toolResults: Array<{
+        tool: string;
+        path: string;
+        entries?: Array<{ path: string }>;
+        error?: string;
+      }>;
+    };
+  };
+  const results = input.repository.toolResults;
+  expect(
+    results.find((r) => r.tool === "list_directory" && r.path === ".")?.entries,
+  ).toContainEqual({ path: "target", type: "directory" });
+  expect(results.find((r) => r.tool === "list_directory" && r.path === "target")?.entries).toEqual([
+    { path, type: "file" },
+  ]);
+  expect(
+    results.find((r) => r.tool === "read_file" && r.path === "target/hidden.ts")?.error,
+  ).toContain("outside the configured repository file set");
+});
+
+it("keeps default exclusions without a changed-file context", async () => {
+  const path = "target/source.ts";
+  const { result } = await fixture(
+    [],
+    {},
+    {
+      ready: false,
+      operations: [{ tool: "read_file", path, cursor: 0, startLine: 1, endLine: 1 }],
+    },
+    undefined,
+    undefined,
+    false,
+    path,
+  );
+  expect(result.citations).toEqual([]);
+  expect(result.retrieval?.filesRead).toBe(0);
+});
+
+it("reads a deleted changed-file patch under target", async () => {
+  const path = "app/target/page.tsx";
+  const { result, requests } = await fixture(
+    [path],
+    {},
+    undefined,
+    undefined,
+    undefined,
+    false,
+    path,
+    "HEAD",
+    false,
+    true,
+  );
+  expect(result.retrieval?.coverage).toMatchObject({ status: "complete", inScopeChangedFiles: 1 });
+  expect(JSON.stringify(requests.at(-1)?.input)).toContain("deleted file mode");
 });
 
 it("obeys existing line and tool limits", async () => {

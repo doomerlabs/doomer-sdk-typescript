@@ -215,7 +215,10 @@ const review = await ctx.model.review<EngineeringReview>({
 
 Repository retrieval provides paginated `list_directory` and line-range `read_file` operations.
 Reads are repository-relative, read-only, symlink-safe, glob-constrained, and bounded by call,
-round, line, and byte budgets. Each successful read creates an immutable citation:
+round, line, and byte budgets. Runner-provided changed files remain readable under default
+excluded directories such as `target`, `build`, and `dist`; their parent directories are visible
+for discovery, while unchanged siblings stay hidden. Explicit `include`/`exclude` filters and
+repository metadata protection still apply. Each successful read creates an immutable citation:
 
 ```ts
 review.citations?.[0];
