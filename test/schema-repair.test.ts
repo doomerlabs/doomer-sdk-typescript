@@ -576,3 +576,62 @@ it("retains retryable schema usage when recovery without validation is exhausted
   });
   expect(fetch).toHaveBeenCalledTimes(2);
 });
+
+it("does not confuse broker pattern failure with a neighboring not constraint", async () => {
+  const patternedSchema = {
+    ...schema,
+    properties: { summary: { ...schema.properties.summary, pattern: "^[A-Z]" } },
+  };
+  const payloads: BrokerPayload[] = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+    payloads.push(JSON.parse(String(init?.body)) as BrokerPayload);
+    return payloads.length === 1
+      ? failure("value 'PRIVATE-MODEL-TEXT' does not match pattern '^[A-Z]'")
+      : reply(valid);
+  });
+  const model = enhanceReviewModel(
+    new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token"),
+    process.cwd(),
+  );
+  await expect(
+    model.review({
+      prompt: "Review",
+      input: {},
+      schema: patternedSchema,
+      validation: { maximumAttempts: 2, validate: () => {} },
+    }),
+  ).resolves.toMatchObject({ output: valid });
+  expect(payloads[1].prompt).toContain("schema pattern");
+  expect(payloads[1].prompt).not.toContain("Leading or trailing whitespace");
+  expect(payloads[1].prompt).not.toContain("PRIVATE-MODEL-TEXT");
+});
+
+it("retains every joined client length constraint in one repair request", async () => {
+  const multipleLimitsSchema = {
+    ...schema,
+    properties: {
+      summary: { ...schema.properties.summary, allOf: [{ maxLength: 80 }, { maxLength: 40 }] },
+    },
+  };
+  const repaired = { summary: "A concise evidence-backed assessment." };
+  const payloads: BrokerPayload[] = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+    payloads.push(JSON.parse(String(init?.body)) as BrokerPayload);
+    return reply(payloads.length === 1 ? { summary: "x".repeat(90) } : repaired);
+  });
+  const model = enhanceReviewModel(
+    new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token"),
+    process.cwd(),
+  );
+  await expect(
+    model.review({
+      prompt: "Review",
+      input: {},
+      schema: multipleLimitsSchema,
+      validation: { maximumAttempts: 2, validate: () => {} },
+    }),
+  ).resolves.toMatchObject({ output: repaired });
+  expect(payloads).toHaveLength(2);
+  expect(payloads[1].prompt).toContain("more than 80 characters");
+  expect(payloads[1].prompt).toContain("more than 40 characters");
+});

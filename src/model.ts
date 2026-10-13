@@ -590,10 +590,25 @@ function schemaValidationFeedback(
   error: ModelReviewError,
   schema: Record<string, unknown>,
 ): string {
-  const goLocation = /- at '([^'\n]*)': ([^\n]*)/.exec(error.message);
-  const clientLocation = /data((?:\/[^\s;:]*)*) (must [^;\n]*)/.exec(error.message);
-  const rawPath = goLocation?.[1] ?? clientLocation?.[1];
-  const detail = goLocation?.[2] ?? clientLocation?.[2] ?? "";
+  const goLocations = [...error.message.matchAll(/- at '([^'\n]*)': ([^\n]*)/g)];
+  const locations =
+    goLocations.length > 0
+      ? goLocations
+      : [...error.message.matchAll(/data((?:\/[^\s;:]*)*) (must [^;\n]*)/g)];
+  const messages =
+    locations.length === 0
+      ? [schemaFailureFeedback(undefined, "", schema)]
+      : locations
+          .slice(0, 32)
+          .map((location) => schemaFailureFeedback(location[1], location[2], schema));
+  return boundedValidationFeedback(new Error([...new Set(messages)].join("\n")));
+}
+
+function schemaFailureFeedback(
+  rawPath: string | undefined,
+  detail: string,
+  schema: Record<string, unknown>,
+): string {
   let node = schema;
   const safePath: string[] = [];
   for (const token of (rawPath ?? "").split("/").filter(Boolean).slice(0, 32)) {
@@ -622,7 +637,11 @@ function schemaValidationFeedback(
     reason = `${length[1]}: got ${length[2]} characters; required ${length[3]}.`;
   } else if (/^must NOT have (more|fewer) than \d+ characters$/.test(detail)) {
     reason = detail;
-  } else if (/\bnot\b/i.test(detail) && typeof node.not === "object" && node.not !== null) {
+  } else if (
+    /^(?:'not' failed|must NOT be valid)$/.test(detail) &&
+    typeof node.not === "object" &&
+    node.not !== null
+  ) {
     const description = (node.not as Record<string, unknown>).description;
     reason =
       typeof description === "string"
@@ -631,9 +650,7 @@ function schemaValidationFeedback(
   } else if (/pattern/.test(detail)) {
     reason = "The value does not satisfy its schema pattern.";
   }
-  return boundedValidationFeedback(
-    new Error(`Model output does not match the requested schema${at}. ${reason}`),
-  );
+  return `Model output does not match the requested schema${at}. ${reason}`;
 }
 
 function boundedValidationFeedback(error: unknown): string {
