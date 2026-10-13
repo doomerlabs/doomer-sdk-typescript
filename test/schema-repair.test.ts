@@ -1,0 +1,265 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, expect, it, vi } from "vitest";
+import { BrokerReviewModel, type ModelReviewResult, enhanceReviewModel } from "../src/index.js";
+
+afterEach(() => vi.restoreAllMocks());
+
+type BrokerPayload = {
+  prompt: string;
+  input: unknown;
+  schema: { properties?: Record<string, unknown> };
+  budget: { timeoutMs: number };
+};
+
+const schema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["summary"],
+  properties: {
+    summary: {
+      type: "string",
+      minLength: 20,
+      maxLength: 800,
+      not: {
+        description: "Leading or trailing whitespace is forbidden; trim the value.",
+        pattern: "^\\s|\\s$",
+      },
+    },
+  },
+};
+const valid = { summary: "The prepared source proves no engineering concern." };
+const fixtures = [
+  {
+    value: "PRIVATE-MODEL-TEXT".padEnd(801, "x"),
+    detail: "maxLength: got 801, want 800",
+    feedback: /maxLength.*801.*800/,
+  },
+  { value: "short", detail: "minLength: got 5, want 20", feedback: /minLength.*5.*20/ },
+  { value: "summary", detail: "minLength: got 7, want 20", feedback: /minLength.*7.*20/ },
+  {
+    value: " PRIVATE-MODEL-TEXT with sufficient length ",
+    detail: "'not' failed",
+    feedback: /Leading or trailing whitespace is forbidden/,
+  },
+];
+
+it.each(fixtures)(
+  "repairs broker schema rejection with retained evidence: $detail",
+  async (fixture) => {
+    await exercise("broker", fixture);
+  },
+);
+it.each(fixtures)(
+  "repairs client schema rejection with retained evidence: $detail",
+  async (fixture) => {
+    await exercise("client", fixture);
+  },
+);
+
+async function exercise(mode: "broker" | "client", fixture: (typeof fixtures)[number]) {
+  const root = await mkdtemp(join(tmpdir(), "sdk-schema-repair-"));
+  const path = join(root, "source.ts");
+  await writeFile(path, "export const evidence = 'ORIGINAL-SOURCE';\n");
+  let planning = 0;
+  const generations: BrokerPayload[] = [];
+  const validations: ModelReviewResult[] = [];
+  let now = 1000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+    const request = JSON.parse(String(init?.body)) as BrokerPayload;
+    expect(request).not.toHaveProperty("validation");
+    if (request.schema.properties?.ready) {
+      planning++;
+      return reply(
+        planning === 1
+          ? {
+              ready: false,
+              operations: [
+                { tool: "read_file", path: "source.ts", cursor: 0, startLine: 1, endLine: 1 },
+              ],
+            }
+          : { ready: true, operations: [] },
+      );
+    }
+    generations.push(request);
+    if (generations.length === 1) {
+      now += 100;
+      await writeFile(path, "export const evidence = 'REPLACED-SOURCE';\n");
+      return mode === "broker" ? failure(fixture.detail) : reply({ summary: fixture.value });
+    }
+    expect(request.input).toEqual(generations[0].input);
+    expect(request.prompt).toContain("SDK VALIDATION FEEDBACK");
+    expect(request.prompt).toContain("/summary");
+    if (mode === "broker" || fixture.detail === "'not' failed")
+      expect(request.prompt).toMatch(fixture.feedback);
+    expect(request.prompt).not.toContain("PRIVATE-MODEL-TEXT");
+    expect(request.budget.timeoutMs).toBe(generations[0].budget.timeoutMs - 100);
+    return reply(valid);
+  });
+  try {
+    const model = enhanceReviewModel(
+      new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token", { maximumAttempts: 1 }),
+      root,
+    );
+    const result = await model.review({
+      prompt: "Review the source.",
+      input: {},
+      schema,
+      budget: { timeoutMs: 5000 },
+      tools: { repository: { include: ["*.ts"], maxRounds: 3, maxToolCalls: 3 } },
+      validation: {
+        maximumAttempts: 2,
+        validate: (value) => {
+          validations.push(value);
+        },
+      },
+    });
+    expect(generations).toHaveLength(2);
+    expect(planning).toBe(2);
+    expect(validations).toHaveLength(1);
+    expect(result.output).toEqual(valid);
+    expect(result.citations?.[0].content).toContain("ORIGINAL-SOURCE");
+    expect(result.citations?.[0].content).not.toContain("REPLACED-SOURCE");
+    expect(validations[0].citations).toEqual(result.citations);
+    expect(validations[0].retrieval).toEqual(result.retrieval);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+it("makes persistent schema rejection terminal after the configured generation attempts", async () => {
+  const fetch = vi
+    .spyOn(globalThis, "fetch")
+    .mockImplementation(async () => failure("maxLength: got 801, want 800"));
+  const validate = vi.fn();
+  const model = enhanceReviewModel(
+    new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token", { maximumAttempts: 1 }),
+    process.cwd(),
+  );
+  await expect(
+    model.review({
+      prompt: "Review",
+      input: {},
+      schema,
+      validation: { maximumAttempts: 2, validate },
+    }),
+  ).rejects.toMatchObject({
+    code: "model_validation_failed",
+    retryable: false,
+    message: expect.stringMatching(/2 attempts.*maxLength.*801.*800/),
+  });
+  expect(fetch).toHaveBeenCalledTimes(2);
+  expect(validate).not.toHaveBeenCalled();
+});
+
+it("redacts quoted model text and unknown instance keys from schema repair feedback", async () => {
+  const payloads: BrokerPayload[] = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+    const payload = JSON.parse(String(init?.body)) as BrokerPayload;
+    payloads.push(payload);
+    return payloads.length === 1
+      ? new Response(
+          JSON.stringify({
+            error: {
+              code: "invalid_model_output",
+              retryable: false,
+              message:
+                "model output does not match requested schema:\n- at '/PRIVATE-INSTANCE-KEY': 'PRIVATE-REJECTED-TEXT must NOT have more than 999 characters; maxLength: got 999, want 1000' does not match pattern 'PRIVATE-PATTERN'",
+            },
+          }),
+          { status: 502 },
+        )
+      : reply(valid);
+  });
+  const model = enhanceReviewModel(
+    new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token"),
+    process.cwd(),
+  );
+  await expect(
+    model.review({
+      prompt: "Review",
+      input: {},
+      schema,
+      validation: { maximumAttempts: 2, validate: () => {} },
+    }),
+  ).resolves.toMatchObject({ output: valid });
+  expect(payloads[1].prompt).toContain("at /*");
+  expect(payloads[1].prompt).toContain("schema pattern");
+  expect(payloads[1].prompt).not.toMatch(/PRIVATE-/);
+});
+
+it.each([
+  "invalid_model_schema",
+  "invalid_model_request",
+  "invalid_broker_response",
+  "model_canceled",
+])("does not treat %s as a schema output repair", async (code) => {
+  const fetch = vi
+    .spyOn(globalThis, "fetch")
+    .mockResolvedValue(
+      new Response(
+        JSON.stringify({ error: { code, message: "Fixture failure", retryable: false } }),
+        { status: 400 },
+      ),
+    );
+  const model = enhanceReviewModel(
+    new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token"),
+    process.cwd(),
+  );
+  await expect(
+    model.review({
+      prompt: "Review",
+      input: {},
+      schema,
+      validation: { maximumAttempts: 2, validate: () => {} },
+    }),
+  ).rejects.toMatchObject({ code });
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+function reply(output: unknown) {
+  return new Response(
+    JSON.stringify({ protocolVersion: 1, provider: "fixture", model: "fixture", output }),
+  );
+}
+function failure(detail: string) {
+  return new Response(
+    JSON.stringify({
+      error: {
+        code: "invalid_model_output",
+        retryable: false,
+        message: `model output does not match requested schema:\n- at '/summary': ${detail}`,
+      },
+    }),
+    { status: 502 },
+  );
+}
+
+it("schema repairs cannot extend the shared generation deadline", async () => {
+  let now = 1000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+    now += 100;
+    return failure("maxLength: got 801, want 800");
+  });
+  const model = enhanceReviewModel(
+    new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token", { maximumAttempts: 1 }),
+    process.cwd(),
+  );
+  await expect(
+    model.review({
+      prompt: "Review",
+      input: {},
+      schema,
+      budget: { timeoutMs: 100 },
+      validation: { maximumAttempts: 3, validate: () => {} },
+    }),
+  ).rejects.toMatchObject({
+    code: "model_request_recovery_exhausted",
+    retryable: false,
+    diagnostics: { attempts: 1, reason: "deadline" },
+  });
+  expect(fetch).toHaveBeenCalledTimes(1);
+});

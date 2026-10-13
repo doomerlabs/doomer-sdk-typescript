@@ -183,6 +183,14 @@ feedback and retries only the final generation call. With repository tools, it r
 retrieved evidence and citations. Exhaustion raises a non-retryable `ModelReviewError` with code
 `model_validation_failed` so hosts do not restart the entire adversary review.
 
+When `validation` is enabled, schema-invalid output rejected by the broker or the
+SDK client (`invalid_model_output`) uses the same bounded final-generation loop,
+before the semantic callback runs. Repair feedback retains schema-owned field
+locations and numeric length limits while excluding quoted rejected text and
+unknown instance keys. Invalid schemas, malformed broker envelopes, cancellation,
+and other model errors retain their existing failure/recovery behavior. Schema and
+semantic repairs share the configured attempt count and original generation deadline.
+
 For repository-scale reviews, add bounded repository tools instead of placing source bodies in
 `input`. The SDK asks the model which directories and line ranges it needs, performs those reads
 inside the rule context's repository boundary, and then makes the final structured review call:

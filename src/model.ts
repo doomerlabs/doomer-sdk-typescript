@@ -428,7 +428,7 @@ export class BrokerReviewModel implements ReviewModel {
 }
 
 /**
- * Run adversary-owned semantic validation with SDK-owned bounded regeneration.
+ * Run schema and adversary-owned semantic validation with SDK-owned bounded regeneration.
  *
  * Each retry receives the validator failure as trusted SDK feedback while retaining the
  * original input. The original timeout is shared by all validation attempts, and usage is
@@ -460,19 +460,27 @@ export async function reviewWithValidation<T>(
     const elapsed = Date.now() - startedAt;
     const remainingTimeoutMs = timeoutMs - elapsed;
     if (remainingTimeoutMs <= 0) throw exhaustedModelRecovery(attempt - 1, "deadline");
-    const result = decorate(
-      await model.review<T>({
-        ...baseRequest,
-        prompt:
-          feedback === undefined
-            ? baseRequest.prompt
-            : `${baseRequest.prompt}\n\nSDK VALIDATION FEEDBACK:\nThe previous response failed adversary-defined validation. Correct the response using this trusted validation result and return the complete response again.\n${JSON.stringify({ attempt, error: feedback })}`,
-        budget: {
-          ...baseRequest.budget,
-          timeoutMs: remainingTimeoutMs,
-        },
-      }),
-    );
+    let result: ModelReviewResult<T>;
+    try {
+      result = decorate(
+        await model.review<T>({
+          ...baseRequest,
+          prompt:
+            feedback === undefined
+              ? baseRequest.prompt
+              : `${baseRequest.prompt}\n\nSDK VALIDATION FEEDBACK:\nThe previous response failed output validation. Correct the response using this trusted validation result and return the complete response again.\n${JSON.stringify({ attempt, error: feedback })}`,
+          budget: { ...baseRequest.budget, timeoutMs: remainingTimeoutMs },
+        }),
+      );
+    } catch (error) {
+      // The broker and client reject schema-invalid output before the adversary
+      // callback runs. Regenerate only this prepared request, never its source reads.
+      if (!(error instanceof ModelReviewError) || error.code !== "invalid_model_output")
+        throw error;
+      feedback = schemaValidationFeedback(error, baseRequest.schema);
+      if (attempt === maximumAttempts) throw exhaustedOutputValidation(maximumAttempts, feedback);
+      continue;
+    }
     usage = addModelUsage(usage, result.usage);
     try {
       await validation.validate(result);
@@ -482,18 +490,72 @@ export async function reviewWithValidation<T>(
       };
     } catch (error) {
       feedback = boundedValidationFeedback(error);
-      if (attempt === maximumAttempts) {
-        throw new ModelReviewError(
-          `Model output failed adversary validation after ${maximumAttempts} attempts: ${feedback}`,
-          { code: "model_validation_failed", retryable: false },
-        );
-      }
+      if (attempt === maximumAttempts) throw exhaustedOutputValidation(maximumAttempts, feedback);
     }
   }
   throw new ModelReviewError("Model validation retry loop exhausted unexpectedly.", {
     code: "model_validation_failed",
     retryable: false,
   });
+}
+
+function exhaustedOutputValidation(attempts: number, feedback: string): ModelReviewError {
+  return new ModelReviewError(
+    `Model output failed adversary validation after ${attempts} attempts: ${feedback}`,
+    { code: "model_validation_failed", retryable: false },
+  );
+}
+
+// Broker pattern/enum errors can quote rejected model text. Retain only schema-owned
+// locations, fixed keywords, numeric limits, and trusted schema descriptions as feedback.
+function schemaValidationFeedback(
+  error: ModelReviewError,
+  schema: Record<string, unknown>,
+): string {
+  const goLocation = /- at '([^'\n]*)': ([^\n]*)/.exec(error.message);
+  const clientLocation = /data((?:\/[^\s;:]*)*) (must [^;\n]*)/.exec(error.message);
+  const rawPath = goLocation?.[1] ?? clientLocation?.[1];
+  const detail = goLocation?.[2] ?? clientLocation?.[2] ?? "";
+  let node = schema;
+  const safePath: string[] = [];
+  for (const token of (rawPath ?? "").split("/").filter(Boolean).slice(0, 32)) {
+    const key = token.replaceAll("~1", "/").replaceAll("~0", "~");
+    const properties = node.properties as Record<string, Record<string, unknown>> | undefined;
+    if (properties && Object.hasOwn(properties, key)) {
+      safePath.push(token.slice(0, 128));
+      node = properties[key];
+    } else if (
+      node.type === "array" &&
+      /^\d{1,8}$/.test(key) &&
+      node.items &&
+      typeof node.items === "object"
+    ) {
+      safePath.push(key);
+      node = node.items as Record<string, unknown>;
+    } else {
+      safePath.push("*");
+      node = {};
+    }
+  }
+  const at = rawPath !== undefined ? ` at /${safePath.join("/")}` : "";
+  const length = /^(minLength|maxLength): got (\d{1,8}), want (\d{1,8})$/.exec(detail);
+  let reason = "Return a complete response that satisfies the supplied schema.";
+  if (length) {
+    reason = `${length[1]}: got ${length[2]} characters; required ${length[3]}.`;
+  } else if (/^must NOT have (more|fewer) than \d+ characters$/.test(detail)) {
+    reason = detail;
+  } else if (/\bnot\b/i.test(detail) && typeof node.not === "object" && node.not !== null) {
+    const description = (node.not as Record<string, unknown>).description;
+    reason =
+      typeof description === "string"
+        ? description
+        : "The value violates a 'not' schema constraint.";
+  } else if (/pattern/.test(detail)) {
+    reason = "The value does not satisfy its schema pattern.";
+  }
+  return boundedValidationFeedback(
+    new Error(`Model output does not match the requested schema${at}. ${reason}`),
+  );
 }
 
 function boundedValidationFeedback(error: unknown): string {
