@@ -25,6 +25,9 @@ const MAX_BROKER_RETRY_DELAY_MS = 5_000;
 const DEFAULT_VALIDATION_MAXIMUM_ATTEMPTS = 3;
 const MAX_VALIDATION_MAXIMUM_ATTEMPTS = 5;
 const MAX_VALIDATION_FEEDBACK_BYTES = 8 << 10;
+// Internal request metadata survives wrapper spreads but never enters broker JSON.
+const outputRepairRequest = Symbol("sdk.output-repair");
+type OutputRepairRequest = ModelReviewRequest & { [outputRepairRequest]?: true };
 
 // Fetch supplies its own five-minute header timeout, overriding Agent defaults.
 // Override dispatch options for this review only; its shared AbortSignal remains
@@ -144,6 +147,7 @@ interface ModelBrokerResponse {
 }
 
 interface ModelBrokerErrorResponse {
+  usage?: ModelReviewUsage;
   error?: {
     code?: string;
     message?: string;
@@ -169,6 +173,8 @@ export class ModelReviewError extends Error {
   readonly code?: string;
   readonly retryable: boolean;
   readonly diagnostics?: Readonly<Record<string, unknown>>;
+  /** Reported usage from completed requests, including rejected output. */
+  readonly usage?: ModelReviewUsage;
 
   constructor(
     message: string,
@@ -176,12 +182,14 @@ export class ModelReviewError extends Error {
       code?: string;
       retryable?: boolean;
       diagnostics?: Readonly<Record<string, unknown>>;
+      usage?: ModelReviewUsage;
     } = {},
   ) {
     super(message);
     this.name = "ModelReviewError";
     this.code = options.code;
     this.diagnostics = options.diagnostics;
+    this.usage = options.usage;
     this.retryable = options.retryable ?? false;
   }
 }
@@ -266,6 +274,7 @@ export class BrokerReviewModel implements ReviewModel {
       );
     }
     const normalized = normalizeRequest(request);
+    const validationOwnsRetries = (request as OutputRepairRequest)[outputRepairRequest] === true;
     const diagnostics = modelAttemptDiagnostics(
       normalized.budget.timeoutMs,
       request.diagnosticStage === "repository_planning" ? "repository_planning" : "model_review",
@@ -273,6 +282,7 @@ export class BrokerReviewModel implements ReviewModel {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), normalized.budget.timeoutMs);
     const dispatcher = new ModelBrokerDispatcher(normalized.budget.timeoutMs);
+    let usage: ModelReviewUsage = {};
     try {
       for (let attempt = 1; attempt <= this.#maximumAttempts; attempt += 1) {
         const outcome = await this.#reviewAttempt<T>(
@@ -282,15 +292,17 @@ export class BrokerReviewModel implements ReviewModel {
           diagnostics,
           attempt,
         );
-        if (outcome.ok) return outcome.result;
+        if (outcome.ok) return withAccumulatedResultUsage(outcome.result, usage);
         const error = outcome.error;
-        if (!(error instanceof ModelReviewError) || !error.retryable) throw error;
-        if (controller.signal.aborted) {
-          throw exhaustedModelRecovery(attempt, "deadline");
-        }
-        if (attempt === this.#maximumAttempts) {
+        if (!(error instanceof ModelReviewError)) throw error;
+        // Only an opted-in validation loop takes ownership of schema retries.
+        // Other callers retain the broker's existing retryable-error behavior.
+        if (!error.retryable || (validationOwnsRetries && error.code === "invalid_model_output"))
+          throw error;
+        usage = addModelUsage(usage, error.usage);
+        if (controller.signal.aborted) throw exhaustedModelRecovery(attempt, "deadline");
+        if (attempt === this.#maximumAttempts)
           throw exhaustedModelRecovery(attempt, "attempt_limit");
-        }
         await this.#waitForRetry(
           attempt,
           controller.signal,
@@ -299,6 +311,9 @@ export class BrokerReviewModel implements ReviewModel {
         );
       }
       throw exhaustedModelRecovery(this.#maximumAttempts, "attempt_limit");
+    } catch (error) {
+      if (!(error instanceof ModelReviewError)) throw error;
+      throw withAccumulatedUsage(error, usage);
     } finally {
       clearTimeout(timeout);
       // Cleanup must not replace the typed request error or a successful response.
@@ -407,17 +422,19 @@ export class BrokerReviewModel implements ReviewModel {
     }
     if (!response.ok) {
       const failure = decoded as ModelBrokerErrorResponse;
+      if (failure.usage !== undefined) validateUsage(failure.usage);
       throw new ModelReviewError(
         failure.error?.message ?? `Model broker returned HTTP ${response.status}.`,
         {
           code: failure.error?.code ?? "model_review_failed",
           retryable: failure.error?.retryable ?? response.status >= 500,
+          ...(failure.usage === undefined ? {} : { usage: failure.usage }),
         },
       );
     }
 
     const envelope = requireBrokerResponse(decoded);
-    validateModelOutput(normalized.schema, envelope.output);
+    validateModelOutput(normalized.schema, envelope.output, envelope.usage);
     return {
       output: envelope.output as T,
       provider: envelope.provider,
@@ -428,7 +445,7 @@ export class BrokerReviewModel implements ReviewModel {
 }
 
 /**
- * Run adversary-owned semantic validation with SDK-owned bounded regeneration.
+ * Run schema and adversary-owned semantic validation with SDK-owned bounded regeneration.
  *
  * Each retry receives the validator failure as trusted SDK feedback while retaining the
  * original input. The original timeout is shared by all validation attempts, and usage is
@@ -459,41 +476,181 @@ export async function reviewWithValidation<T>(
   for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
     const elapsed = Date.now() - startedAt;
     const remainingTimeoutMs = timeoutMs - elapsed;
-    if (remainingTimeoutMs <= 0) throw exhaustedModelRecovery(attempt - 1, "deadline");
-    const result = decorate(
-      await model.review<T>({
-        ...baseRequest,
-        prompt:
-          feedback === undefined
-            ? baseRequest.prompt
-            : `${baseRequest.prompt}\n\nSDK VALIDATION FEEDBACK:\nThe previous response failed adversary-defined validation. Correct the response using this trusted validation result and return the complete response again.\n${JSON.stringify({ attempt, error: feedback })}`,
-        budget: {
-          ...baseRequest.budget,
-          timeoutMs: remainingTimeoutMs,
-        },
-      }),
-    );
-    usage = addModelUsage(usage, result.usage);
+    if (remainingTimeoutMs <= 0)
+      throw withAccumulatedUsage(exhaustedModelRecovery(attempt - 1, "deadline"), usage);
+    let outcome: OutputValidationAttempt<T>;
     try {
-      await validation.validate(result);
+      outcome = await reviewValidationAttempt(
+        model,
+        {
+          ...baseRequest,
+          prompt:
+            feedback === undefined
+              ? baseRequest.prompt
+              : `${baseRequest.prompt}\n\nSDK VALIDATION FEEDBACK:\nThe previous response failed output validation. Correct the response using this trusted validation result and return the complete response again.\n${JSON.stringify({ attempt, error: feedback })}`,
+          budget: { ...baseRequest.budget, timeoutMs: remainingTimeoutMs },
+        },
+        validation,
+        decorate,
+      );
+    } catch (error) {
+      if (!(error instanceof ModelReviewError)) throw error;
+      throw withAccumulatedUsage(error, usage);
+    }
+    usage = addModelUsage(usage, outcome.ok ? outcome.result.usage : outcome.usage);
+    if (outcome.ok) {
       return {
-        ...result,
+        ...outcome.result,
         ...(usage.inputTokens === undefined && usage.outputTokens === undefined ? {} : { usage }),
       };
-    } catch (error) {
-      feedback = boundedValidationFeedback(error);
-      if (attempt === maximumAttempts) {
-        throw new ModelReviewError(
-          `Model output failed adversary validation after ${maximumAttempts} attempts: ${feedback}`,
-          { code: "model_validation_failed", retryable: false },
-        );
-      }
     }
+    feedback = outcome.feedback;
+    if (attempt === maximumAttempts)
+      throw exhaustedOutputValidation(maximumAttempts, feedback, usage);
   }
   throw new ModelReviewError("Model validation retry loop exhausted unexpectedly.", {
     code: "model_validation_failed",
     retryable: false,
   });
+}
+
+type OutputValidationAttempt<T> =
+  | { ok: true; result: ModelReviewResult<T> }
+  | { ok: false; feedback: string; usage?: ModelReviewUsage };
+
+// Keep generation and semantic validation failures together for one prepared
+// request. Neither kind of rejection repeats repository evidence gathering.
+async function reviewValidationAttempt<T>(
+  model: ReviewModel,
+  request: ModelReviewRequest<T>,
+  validation: ModelReviewValidation<T>,
+  decorate: (result: ModelReviewResult<T>) => ModelReviewResult<T>,
+): Promise<OutputValidationAttempt<T>> {
+  let result: ModelReviewResult<T>;
+  try {
+    const prepared: OutputRepairRequest = { ...request, [outputRepairRequest]: true };
+    result = decorate(await model.review<T>(prepared));
+  } catch (error) {
+    if (!(error instanceof ModelReviewError) || error.code !== "invalid_model_output") throw error;
+    return {
+      ok: false,
+      feedback: schemaValidationFeedback(error, request.schema),
+      usage: error.usage,
+    };
+  }
+  try {
+    await validation.validate(result);
+    return { ok: true, result };
+  } catch (error) {
+    return { ok: false, feedback: boundedValidationFeedback(error), usage: result.usage };
+  }
+}
+
+function withAccumulatedResultUsage<T>(
+  result: ModelReviewResult<T>,
+  accumulated: ModelReviewUsage,
+): ModelReviewResult<T> {
+  const usage = addModelUsage(accumulated, result.usage);
+  return {
+    ...result,
+    ...(usage.inputTokens === undefined && usage.outputTokens === undefined ? {} : { usage }),
+  };
+}
+
+// Keep interruption classification and metadata intact without mutating an error
+// that a model implementation may reuse. Current-error usage is counted once.
+function withAccumulatedUsage(error: ModelReviewError, usage: ModelReviewUsage): ModelReviewError {
+  if (usage.inputTokens === undefined && usage.outputTokens === undefined) return error;
+  return new ModelReviewError(error.message, {
+    code: error.code,
+    retryable: error.retryable,
+    diagnostics: error.diagnostics,
+    usage: addModelUsage(usage, error.usage),
+  });
+}
+
+function exhaustedOutputValidation(
+  attempts: number,
+  feedback: string,
+  usage: ModelReviewUsage,
+): ModelReviewError {
+  return new ModelReviewError(
+    `Model output failed adversary validation after ${attempts} attempts: ${feedback}`,
+    {
+      code: "model_validation_failed",
+      retryable: false,
+      ...(usage.inputTokens === undefined && usage.outputTokens === undefined ? {} : { usage }),
+    },
+  );
+}
+
+// Broker pattern/enum errors can quote rejected model text. Retain only schema-owned
+// locations, fixed keywords, numeric limits, and trusted schema descriptions as feedback.
+function schemaValidationFeedback(
+  error: ModelReviewError,
+  schema: Record<string, unknown>,
+): string {
+  const goLocations = [...error.message.matchAll(/- at '([^'\n]*)': ([^\n]*)/g)];
+  const locations =
+    goLocations.length > 0
+      ? goLocations
+      : [...error.message.matchAll(/data((?:\/[^\s;:]*)*) (must [^;\n]*)/g)];
+  const messages =
+    locations.length === 0
+      ? [schemaFailureFeedback(undefined, "", schema)]
+      : locations
+          .slice(0, 32)
+          .map((location) => schemaFailureFeedback(location[1], location[2], schema));
+  return boundedValidationFeedback(new Error([...new Set(messages)].join("\n")));
+}
+
+function schemaFailureFeedback(
+  rawPath: string | undefined,
+  detail: string,
+  schema: Record<string, unknown>,
+): string {
+  let node = schema;
+  const safePath: string[] = [];
+  for (const token of (rawPath ?? "").split("/").filter(Boolean).slice(0, 32)) {
+    const key = token.replaceAll("~1", "/").replaceAll("~0", "~");
+    const properties = node.properties as Record<string, Record<string, unknown>> | undefined;
+    if (properties && Object.hasOwn(properties, key)) {
+      safePath.push(token.slice(0, 128));
+      node = properties[key];
+    } else if (
+      node.type === "array" &&
+      /^\d{1,8}$/.test(key) &&
+      node.items &&
+      typeof node.items === "object"
+    ) {
+      safePath.push(key);
+      node = node.items as Record<string, unknown>;
+    } else {
+      safePath.push("*");
+      node = {};
+    }
+  }
+  const at = rawPath !== undefined ? ` at /${safePath.join("/")}` : "";
+  const length = /^(minLength|maxLength): got (\d{1,8}), want (\d{1,8})$/.exec(detail);
+  let reason = "Return a complete response that satisfies the supplied schema.";
+  if (length) {
+    reason = `${length[1]}: got ${length[2]} characters; required ${length[3]}.`;
+  } else if (/^must NOT have (more|fewer) than \d+ characters$/.test(detail)) {
+    reason = detail;
+  } else if (
+    /^(?:'not' failed|must NOT be valid)$/.test(detail) &&
+    typeof node.not === "object" &&
+    node.not !== null
+  ) {
+    const description = (node.not as Record<string, unknown>).description;
+    reason =
+      typeof description === "string"
+        ? description
+        : "The value violates a 'not' schema constraint.";
+  } else if (/pattern/.test(detail)) {
+    reason = "The value does not satisfy its schema pattern.";
+  }
+  return `Model output does not match the requested schema${at}. ${reason}`;
 }
 
 function boundedValidationFeedback(error: unknown): string {
@@ -725,7 +882,11 @@ function validateUsage(value: unknown): asserts value is ModelReviewUsage {
   }
 }
 
-function validateModelOutput(schema: Record<string, unknown>, output: unknown): void {
+function validateModelOutput(
+  schema: Record<string, unknown>,
+  output: unknown,
+  usage?: ModelReviewUsage,
+): void {
   const ajv = new Ajv2020({ allErrors: true, strict: true });
   let validate: ReturnType<Ajv2020["compile"]>;
   try {
@@ -740,6 +901,7 @@ function validateModelOutput(schema: Record<string, unknown>, output: unknown): 
     const detail = ajv.errorsText(validate.errors, { separator: "; " });
     throw new ModelReviewError(`Model output does not match the requested schema: ${detail}`, {
       code: "invalid_model_output",
+      ...(usage === undefined ? {} : { usage }),
     });
   }
 }
