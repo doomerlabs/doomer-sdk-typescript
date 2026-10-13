@@ -1,6 +1,6 @@
 {
   "name": "@adversarylabs/sdk",
-  "version": "0.1.40",
+  "version": "0.1.41",
   "description": "Small TypeScript SDK for authoring Adversaries.",
   "type": "module",
   "license": "Apache-2.0",
