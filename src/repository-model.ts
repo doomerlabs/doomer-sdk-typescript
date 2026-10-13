@@ -42,10 +42,9 @@ const PLANNING_OUTPUT_TOKENS = 1_500;
 const DEFAULT_PLANNING_TIMEOUT_MS = 600_000;
 const execFileAsync = promisify(execFile);
 
+const metadataSegments = new Set([".git", ".hg", ".svn"]);
+
 const defaultExcludedSegments = new Set([
-  ".git",
-  ".hg",
-  ".svn",
   "node_modules",
   "dist",
   "build",
@@ -247,7 +246,7 @@ export async function reviewWithRepositoryTools<T>(
   model: ReviewModel,
   repositoryRoot: string | undefined,
   request: ModelReviewRequest,
-  change?: ModelRepositoryChange | null,
+  runnerChange?: ModelRepositoryChange | null,
   reviewer?: string,
 ): Promise<ModelReviewResult<T>> {
   if (repositoryRoot === undefined || repositoryRoot.trim() === "") {
@@ -257,9 +256,27 @@ export async function reviewWithRepositoryTools<T>(
   }
   const options = request.tools?.repository;
   if (options === undefined) return model.review<T>(request);
+  // Use one canonical change set for filters, reads, coverage, and summaries.
+  // Keep invalid paths so guarded reads report gaps rather than dropping them.
+  const change =
+    runnerChange == null
+      ? runnerChange
+      : {
+          ...runnerChange,
+          changedFiles: runnerChange.changedFiles.map((path) => {
+            const normalized = normalizeRepositoryPath(path);
+            if (normalized === ".") {
+              throw new ModelReviewError(
+                "Repository change paths must identify files, not an empty path or repository root.",
+                { code: "invalid_model_request" },
+              );
+            }
+            return normalized ?? path;
+          }),
+        };
   const budget = normalizeToolBudget(options);
   const include = compilePatterns(options.include ?? [], "tools.repository.include");
-  const exclude = compilePatterns(options.exclude ?? [], "tools.repository.exclude");
+  const exclude = repositoryExclusions(options.exclude ?? [], change);
   const inScopePaths =
     change?.changedFiles.filter(
       (path) => isIncluded(path, include) && !isExcluded(path, exclude),
@@ -617,7 +634,7 @@ async function readRepositoryOperation(
   operation: RepositoryOperation,
   budget: RepositoryToolBudget,
   include: readonly RegExp[],
-  exclude: readonly RegExp[],
+  exclude: RepositoryExclusions,
   change: ModelRepositoryChange | null | undefined,
   citationId: string,
 ): Promise<{
@@ -714,7 +731,7 @@ function sourceRecoveryOperations(
   completed: ReadonlySet<string>,
   budget: RepositoryToolBudget,
   include: readonly RegExp[],
-  exclude: readonly RegExp[],
+  exclude: RepositoryExclusions,
 ): RecoveryPlan {
   const operations: RepositoryOperation[] = [];
   const reasons = new Set<string>();
@@ -982,7 +999,7 @@ async function executeListDirectory(
   cursor: number,
   pageSize: number,
   include: readonly RegExp[],
-  exclude: readonly RegExp[],
+  exclude: RepositoryExclusions,
 ): Promise<DirectoryToolResult> {
   if (!Number.isInteger(cursor) || cursor < 0) {
     throw new Error("list_directory cursor must be a non-negative integer");
@@ -1039,7 +1056,7 @@ async function executeReadFile(
   operation: RepositoryOperation,
   budget: RepositoryToolBudget,
   include: readonly RegExp[],
-  exclude: readonly RegExp[],
+  exclude: RepositoryExclusions,
   citationId: string,
 ): Promise<ReadToolResult> {
   if (
@@ -1118,7 +1135,7 @@ async function executeReadChange(
   operation: RepositoryOperation,
   budget: RepositoryToolBudget,
   include: readonly RegExp[],
-  exclude: readonly RegExp[],
+  exclude: RepositoryExclusions,
   change: ModelRepositoryChange | null | undefined,
 ): Promise<ChangeToolResult> {
   if (change === undefined || change === null || change.baseRef === undefined) {
@@ -1224,7 +1241,7 @@ function reportMissingReads(
   change: ModelRepositoryChange | null | undefined,
   results: readonly RepositoryToolResult[],
   include: readonly RegExp[],
-  exclude: readonly RegExp[],
+  exclude: RepositoryExclusions,
   discardedChanges: ReadonlySet<string>,
   emit: (details: Record<string, string | number | boolean>) => void,
 ): void {
@@ -1377,12 +1394,44 @@ function isIncluded(path: string, include: readonly RegExp[]): boolean {
   return include.length === 0 || include.some((pattern) => pattern.test(path));
 }
 
-function isExcluded(path: string, exclude: readonly RegExp[]): boolean {
+interface RepositoryExclusions {
+  patterns: readonly RegExp[];
+  changedPaths: ReadonlySet<string>;
+  changedDirectories: ReadonlySet<string>;
+}
+
+function repositoryExclusions(
+  patterns: readonly string[],
+  change: ModelRepositoryChange | null | undefined,
+): RepositoryExclusions {
+  const changedPaths = new Set<string>();
+  const changedDirectories = new Set<string>();
+  for (const path of change?.changedFiles ?? []) {
+    changedPaths.add(path);
+    const segments = path.split("/");
+    for (let index = 1; index < segments.length; index += 1) {
+      changedDirectories.add(segments.slice(0, index).join("/"));
+    }
+  }
+  return {
+    patterns: compilePatterns(patterns, "tools.repository.exclude"),
+    changedPaths,
+    changedDirectories,
+  };
+}
+
+function isExcluded(path: string, exclude: RepositoryExclusions): boolean {
   const segments = path.split("/");
-  return (
-    segments.some((segment) => defaultExcludedSegments.has(segment)) ||
-    exclude.some((pattern) => pattern.test(path))
-  );
+  if (
+    segments.some((segment) => metadataSegments.has(segment)) ||
+    exclude.patterns.some((pattern) => pattern.test(path))
+  )
+    return true;
+  // Runner-provided changes override discovery defaults, but never explicit
+  // exclusions or Git metadata protection. Ancestors allow directory discovery
+  // without exposing unchanged siblings under normally hidden directories.
+  if (exclude.changedPaths.has(path) || exclude.changedDirectories.has(path)) return false;
+  return segments.some((segment) => defaultExcludedSegments.has(segment));
 }
 
 function requireRepositoryPlan(value: unknown): RepositoryPlan {
