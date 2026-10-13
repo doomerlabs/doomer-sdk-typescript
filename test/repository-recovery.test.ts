@@ -418,6 +418,30 @@ it.each([
   expect(result.citations?.[0].content).toContain("source evidence");
 });
 
+it.each(["", " \t\n ", ".", "./", " ./ "])(
+  "rejects empty or root-only changed path %j before model retrieval",
+  async (path) => {
+    const root = await mkdtemp(join(tmpdir(), "sdk-invalid-changed-path-"));
+    const review = vi.fn();
+    try {
+      await expect(
+        reviewWithRepositoryTools(
+          { review },
+          root,
+          { prompt: "Review", input: {}, schema: { type: "object" }, tools: { repository: {} } },
+          { baseRef: "HEAD", changedFiles: [path], worktree: true },
+        ),
+      ).rejects.toMatchObject({
+        code: "invalid_model_request",
+        message: expect.stringContaining("must identify files"),
+      });
+      expect(review).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
 it.each(["./app/target/page.tsx", "app\\target\\page.tsx", " app/target/page.tsx "])(
   "uses canonical runner path %s for filters, patch reads, and source coverage",
   async (runnerPath) => {

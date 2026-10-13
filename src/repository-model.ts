@@ -263,9 +263,16 @@ export async function reviewWithRepositoryTools<T>(
       ? runnerChange
       : {
           ...runnerChange,
-          changedFiles: runnerChange.changedFiles.map(
-            (path) => normalizeRepositoryPath(path) ?? path,
-          ),
+          changedFiles: runnerChange.changedFiles.map((path) => {
+            const normalized = normalizeRepositoryPath(path);
+            if (normalized === ".") {
+              throw new ModelReviewError(
+                "Repository change paths must identify files, not an empty path or repository root.",
+                { code: "invalid_model_request" },
+              );
+            }
+            return normalized ?? path;
+          }),
         };
   const budget = normalizeToolBudget(options);
   const include = compilePatterns(options.include ?? [], "tools.repository.include");
