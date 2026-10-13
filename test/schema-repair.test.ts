@@ -231,13 +231,13 @@ function reply(output: unknown, usage?: ModelReviewUsage) {
     JSON.stringify({ protocolVersion: 1, provider: "fixture", model: "fixture", output, usage }),
   );
 }
-function failure(detail: string, usage?: ModelReviewUsage) {
+function failure(detail: string, usage?: ModelReviewUsage, retryable = false) {
   return new Response(
     JSON.stringify({
       usage,
       error: {
         code: "invalid_model_output",
-        retryable: false,
+        retryable,
         message: `model output does not match requested schema:\n- at '/summary': ${detail}`,
       },
     }),
@@ -479,4 +479,60 @@ it("schema repairs cannot extend the shared generation deadline", async () => {
     diagnostics: { attempts: 1, reason: "deadline" },
   });
   expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it("routes retryable broker schema rejection through bounded repair with feedback and usage", async () => {
+  const payloads: BrokerPayload[] = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+    payloads.push(JSON.parse(String(init?.body)) as BrokerPayload);
+    return payloads.length > 1
+      ? reply(valid, { inputTokens: 10, outputTokens: 5 })
+      : failure("maxLength: got 801, want 800", { inputTokens: 100, outputTokens: 50 }, true);
+  });
+  const model = enhanceReviewModel(
+    new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token", {
+      maximumAttempts: 5,
+      initialRetryDelayMs: 0,
+    }),
+    process.cwd(),
+  );
+  const result = await model.review({
+    prompt: "Review",
+    input: { evidence: "retained" },
+    schema,
+    validation: { maximumAttempts: 2, validate: () => {} },
+  });
+  expect(payloads).toHaveLength(2);
+  expect(payloads[1].prompt).toContain("SDK VALIDATION FEEDBACK");
+  expect(payloads[1].prompt).toMatch(/maxLength.*801.*800/);
+  expect(payloads[1].input).toEqual(payloads[0].input);
+  expect(result.usage).toEqual({ inputTokens: 110, outputTokens: 55 });
+});
+
+it("does not multiply the validation budget for retryable schema envelopes", async () => {
+  const fetch = vi
+    .spyOn(globalThis, "fetch")
+    .mockImplementation(async () =>
+      failure("minLength: got 5, want 20", { inputTokens: 100, outputTokens: 50 }, true),
+    );
+  const model = enhanceReviewModel(
+    new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token", {
+      maximumAttempts: 5,
+      initialRetryDelayMs: 0,
+    }),
+    process.cwd(),
+  );
+  await expect(
+    model.review({
+      prompt: "Review",
+      input: {},
+      schema,
+      validation: { maximumAttempts: 2, validate: () => {} },
+    }),
+  ).rejects.toMatchObject({
+    code: "model_validation_failed",
+    retryable: false,
+    usage: { inputTokens: 200, outputTokens: 100 },
+  });
+  expect(fetch).toHaveBeenCalledTimes(2);
 });

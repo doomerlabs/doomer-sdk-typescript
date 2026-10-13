@@ -289,6 +289,9 @@ export class BrokerReviewModel implements ReviewModel {
         );
         if (outcome.ok) return outcome.result;
         const error = outcome.error;
+        // Schema rejection belongs to the validation loop, even when an older
+        // broker marks it retryable. Transport retries cannot supply repair feedback.
+        if (error instanceof ModelReviewError && error.code === "invalid_model_output") throw error;
         if (!(error instanceof ModelReviewError) || !error.retryable) throw error;
         if (controller.signal.aborted) {
           throw exhaustedModelRecovery(attempt, "deadline");
@@ -468,46 +471,71 @@ export async function reviewWithValidation<T>(
     const remainingTimeoutMs = timeoutMs - elapsed;
     if (remainingTimeoutMs <= 0)
       throw withAccumulatedUsage(exhaustedModelRecovery(attempt - 1, "deadline"), usage);
-    let result: ModelReviewResult<T>;
+    let outcome: OutputValidationAttempt<T>;
     try {
-      result = decorate(
-        await model.review<T>({
+      outcome = await reviewValidationAttempt(
+        model,
+        {
           ...baseRequest,
           prompt:
             feedback === undefined
               ? baseRequest.prompt
               : `${baseRequest.prompt}\n\nSDK VALIDATION FEEDBACK:\nThe previous response failed output validation. Correct the response using this trusted validation result and return the complete response again.\n${JSON.stringify({ attempt, error: feedback })}`,
           budget: { ...baseRequest.budget, timeoutMs: remainingTimeoutMs },
-        }),
+        },
+        validation,
+        decorate,
       );
     } catch (error) {
-      // The broker and client reject schema-invalid output before the adversary
-      // callback runs. Regenerate only this prepared request, never its source reads.
       if (!(error instanceof ModelReviewError)) throw error;
-      if (error.code !== "invalid_model_output") throw withAccumulatedUsage(error, usage);
-      usage = addModelUsage(usage, error.usage);
-      feedback = schemaValidationFeedback(error, baseRequest.schema);
-      if (attempt === maximumAttempts)
-        throw exhaustedOutputValidation(maximumAttempts, feedback, usage);
-      continue;
+      throw withAccumulatedUsage(error, usage);
     }
-    usage = addModelUsage(usage, result.usage);
-    try {
-      await validation.validate(result);
+    usage = addModelUsage(usage, outcome.ok ? outcome.result.usage : outcome.usage);
+    if (outcome.ok) {
       return {
-        ...result,
+        ...outcome.result,
         ...(usage.inputTokens === undefined && usage.outputTokens === undefined ? {} : { usage }),
       };
-    } catch (error) {
-      feedback = boundedValidationFeedback(error);
-      if (attempt === maximumAttempts)
-        throw exhaustedOutputValidation(maximumAttempts, feedback, usage);
     }
+    feedback = outcome.feedback;
+    if (attempt === maximumAttempts)
+      throw exhaustedOutputValidation(maximumAttempts, feedback, usage);
   }
   throw new ModelReviewError("Model validation retry loop exhausted unexpectedly.", {
     code: "model_validation_failed",
     retryable: false,
   });
+}
+
+type OutputValidationAttempt<T> =
+  | { ok: true; result: ModelReviewResult<T> }
+  | { ok: false; feedback: string; usage?: ModelReviewUsage };
+
+// Keep generation and semantic validation failures together for one prepared
+// request. Neither kind of rejection repeats repository evidence gathering.
+async function reviewValidationAttempt<T>(
+  model: ReviewModel,
+  request: ModelReviewRequest<T>,
+  validation: ModelReviewValidation<T>,
+  decorate: (result: ModelReviewResult<T>) => ModelReviewResult<T>,
+): Promise<OutputValidationAttempt<T>> {
+  let result: ModelReviewResult<T>;
+  try {
+    result = decorate(await model.review<T>(request));
+  } catch (error) {
+    if (!(error instanceof ModelReviewError) || error.code !== "invalid_model_output") throw error;
+    return {
+      ok: false,
+      feedback: schemaValidationFeedback(error, request.schema),
+      usage: error.usage,
+    };
+  }
+  try {
+    await validation.validate(result);
+    return { ok: true, result };
+  } catch (error) {
+    return { ok: false, feedback: boundedValidationFeedback(error), usage: result.usage };
+  }
 }
 
 // Keep interruption classification and metadata intact without mutating an error
