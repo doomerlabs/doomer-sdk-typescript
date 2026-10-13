@@ -1,0 +1,24 @@
+test/repository-recovery.test.ts
+  s_d2ebbefc994d67::t_3b71f1e7dabfa5 819,860
+  s_d2ebbefc994d67::t_65aa613bbb5c4a 753-754,769-770,772-818,820-859,861-872,886
+  s_d2ebbefc994d67::t_7a377d9ce21f62 873-885,887-896
+src/repository-model.ts
+  s_d2ebbefc994d67::t_734801fd76f006 4,1130-1132,1154,1157,1317,1329,1331-1340,1343,1349
+  s_d2ebbefc994d67::t_24587d89dad24c 2,1166-1170,1330
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6aee3e077c95104dca429993a52b496ccbdd512a",
+  "prompts": {},
+  "sessions": {
+    "s_d2ebbefc994d67": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13119-e791-7881-b65b-9f7a05353c78",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Mikhail Swift <mikhail@replicated.com>"
+    }
+  }
+}
