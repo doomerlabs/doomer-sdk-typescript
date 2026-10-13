@@ -194,8 +194,9 @@ semantic repairs share the configured attempt count and original generation dead
 Reported token usage survives client schema rejection and broker error envelopes with
 an optional `usage` field. Repairs aggregate rejected and accepted completions exactly
 once; 100 input / 50 output tokens followed by 10 / 5 returns 110 / 55. Exhausted
-validation exposes the accumulated counts on `ModelReviewError.usage`. Missing usage
-stays unavailable rather than being invented as zero.
+validation and interrupted repairs expose accumulated counts on
+`ModelReviewError.usage`, retaining the error code, retryability, and diagnostics.
+Missing usage stays unavailable rather than being invented as zero.
 
 For repository-scale reviews, add bounded repository tools instead of placing source bodies in
 `input`. The SDK asks the model which directories and line ranges it needs, performs those reads

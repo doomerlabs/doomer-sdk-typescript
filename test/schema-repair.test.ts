@@ -4,10 +4,12 @@ import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import {
   BrokerReviewModel,
+  ModelReviewError,
   type ModelReviewResult,
   type ModelReviewUsage,
   enhanceReviewModel,
 } from "../src/index.js";
+import { reviewWithValidation } from "../src/model.js";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -322,6 +324,135 @@ it("validates usage on broker error envelopes before accounting or repair", asyn
   ).rejects.toMatchObject({ code: "invalid_broker_response" });
   expect(fetch).toHaveBeenCalledTimes(1);
 });
+
+it.each(["broker", "client", "semantic"] as const)(
+  "preserves completed usage when %s repair is canceled",
+  async (mode) => {
+    let calls = 0;
+    const validate = vi.fn(() => {
+      throw new Error("Use the retained evidence.");
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      calls++;
+      if (calls > 1)
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: "model_canceled",
+              message: "Fixture review was canceled.",
+              retryable: false,
+            },
+          }),
+          { status: 503 },
+        );
+      const usage = { inputTokens: 100, outputTokens: 50 };
+      return mode === "broker"
+        ? failure("minLength: got 5, want 20", usage)
+        : reply(mode === "client" ? { summary: "short" } : valid, usage);
+    });
+    const model = enhanceReviewModel(
+      new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token", { maximumAttempts: 1 }),
+      process.cwd(),
+    );
+    await expect(
+      model.review({
+        prompt: "Review",
+        input: {},
+        schema,
+        validation: { maximumAttempts: 3, validate },
+      }),
+    ).rejects.toMatchObject({
+      code: "model_canceled",
+      retryable: false,
+      message: "Fixture review was canceled.",
+      usage: { inputTokens: 100, outputTokens: 50 },
+    });
+    expect(calls).toBe(2);
+    expect(validate).toHaveBeenCalledTimes(mode === "semantic" ? 1 : 0);
+  },
+);
+
+it.each(["broker", "client", "semantic"] as const)(
+  "preserves completed usage when the %s repair deadline expires",
+  async (mode) => {
+    let now = 1000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      now += 100;
+      const usage = { inputTokens: 100, outputTokens: 50 };
+      return mode === "broker"
+        ? failure("minLength: got 5, want 20", usage)
+        : reply(mode === "client" ? { summary: "short" } : valid, usage);
+    });
+    const model = enhanceReviewModel(
+      new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token", { maximumAttempts: 1 }),
+      process.cwd(),
+    );
+    await expect(
+      model.review({
+        prompt: "Review",
+        input: {},
+        schema,
+        budget: { timeoutMs: 100 },
+        validation: {
+          maximumAttempts: 3,
+          validate: () => {
+            throw new Error("Use the retained evidence.");
+          },
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "model_request_recovery_exhausted",
+      retryable: false,
+      diagnostics: { attempts: 1, reason: "deadline" },
+      usage: { inputTokens: 100, outputTokens: 50 },
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  },
+);
+
+it.each([false, true])(
+  "preserves model-error metadata and current usage (retryable=%s)",
+  async (retryable) => {
+    const interruption = new ModelReviewError("Fixture interruption", {
+      code: "model_canceled",
+      retryable,
+      diagnostics: { reason: "fixture interruption" },
+      usage: { inputTokens: 10, outputTokens: 5 },
+    });
+    let calls = 0;
+    await expect(
+      reviewWithValidation(
+        {
+          review: async () => {
+            if (++calls > 1) throw interruption;
+            throw new ModelReviewError(
+              "Model output does not match the requested schema: data/summary must NOT have fewer than 20 characters",
+              {
+                code: "invalid_model_output",
+                usage: { inputTokens: 100, outputTokens: 50 },
+              },
+            );
+          },
+        },
+        {
+          prompt: "Review",
+          input: {},
+          schema,
+          validation: { maximumAttempts: 3, validate: () => {} },
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: interruption.code,
+      retryable,
+      message: interruption.message,
+      diagnostics: interruption.diagnostics,
+      usage: { inputTokens: 110, outputTokens: 55 },
+    });
+    expect(calls).toBe(2);
+    expect(interruption.usage).toEqual({ inputTokens: 10, outputTokens: 5 });
+  },
+);
 
 it("schema repairs cannot extend the shared generation deadline", async () => {
   let now = 1000;

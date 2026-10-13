@@ -466,7 +466,8 @@ export async function reviewWithValidation<T>(
   for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
     const elapsed = Date.now() - startedAt;
     const remainingTimeoutMs = timeoutMs - elapsed;
-    if (remainingTimeoutMs <= 0) throw exhaustedModelRecovery(attempt - 1, "deadline");
+    if (remainingTimeoutMs <= 0)
+      throw withAccumulatedUsage(exhaustedModelRecovery(attempt - 1, "deadline"), usage);
     let result: ModelReviewResult<T>;
     try {
       result = decorate(
@@ -482,8 +483,8 @@ export async function reviewWithValidation<T>(
     } catch (error) {
       // The broker and client reject schema-invalid output before the adversary
       // callback runs. Regenerate only this prepared request, never its source reads.
-      if (!(error instanceof ModelReviewError) || error.code !== "invalid_model_output")
-        throw error;
+      if (!(error instanceof ModelReviewError)) throw error;
+      if (error.code !== "invalid_model_output") throw withAccumulatedUsage(error, usage);
       usage = addModelUsage(usage, error.usage);
       feedback = schemaValidationFeedback(error, baseRequest.schema);
       if (attempt === maximumAttempts)
@@ -506,6 +507,18 @@ export async function reviewWithValidation<T>(
   throw new ModelReviewError("Model validation retry loop exhausted unexpectedly.", {
     code: "model_validation_failed",
     retryable: false,
+  });
+}
+
+// Keep interruption classification and metadata intact without mutating an error
+// that a model implementation may reuse. Current-error usage is counted once.
+function withAccumulatedUsage(error: ModelReviewError, usage: ModelReviewUsage): ModelReviewError {
+  if (usage.inputTokens === undefined && usage.outputTokens === undefined) return error;
+  return new ModelReviewError(error.message, {
+    code: error.code,
+    retryable: error.retryable,
+    diagnostics: error.diagnostics,
+    usage: addModelUsage(usage, error.usage),
   });
 }
 
