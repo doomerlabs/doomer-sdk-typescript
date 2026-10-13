@@ -144,6 +144,7 @@ interface ModelBrokerResponse {
 }
 
 interface ModelBrokerErrorResponse {
+  usage?: ModelReviewUsage;
   error?: {
     code?: string;
     message?: string;
@@ -169,6 +170,8 @@ export class ModelReviewError extends Error {
   readonly code?: string;
   readonly retryable: boolean;
   readonly diagnostics?: Readonly<Record<string, unknown>>;
+  /** Reported usage from completed requests, including rejected output. */
+  readonly usage?: ModelReviewUsage;
 
   constructor(
     message: string,
@@ -176,12 +179,14 @@ export class ModelReviewError extends Error {
       code?: string;
       retryable?: boolean;
       diagnostics?: Readonly<Record<string, unknown>>;
+      usage?: ModelReviewUsage;
     } = {},
   ) {
     super(message);
     this.name = "ModelReviewError";
     this.code = options.code;
     this.diagnostics = options.diagnostics;
+    this.usage = options.usage;
     this.retryable = options.retryable ?? false;
   }
 }
@@ -407,17 +412,19 @@ export class BrokerReviewModel implements ReviewModel {
     }
     if (!response.ok) {
       const failure = decoded as ModelBrokerErrorResponse;
+      if (failure.usage !== undefined) validateUsage(failure.usage);
       throw new ModelReviewError(
         failure.error?.message ?? `Model broker returned HTTP ${response.status}.`,
         {
           code: failure.error?.code ?? "model_review_failed",
           retryable: failure.error?.retryable ?? response.status >= 500,
+          ...(failure.usage === undefined ? {} : { usage: failure.usage }),
         },
       );
     }
 
     const envelope = requireBrokerResponse(decoded);
-    validateModelOutput(normalized.schema, envelope.output);
+    validateModelOutput(normalized.schema, envelope.output, envelope.usage);
     return {
       output: envelope.output as T,
       provider: envelope.provider,
@@ -477,8 +484,10 @@ export async function reviewWithValidation<T>(
       // callback runs. Regenerate only this prepared request, never its source reads.
       if (!(error instanceof ModelReviewError) || error.code !== "invalid_model_output")
         throw error;
+      usage = addModelUsage(usage, error.usage);
       feedback = schemaValidationFeedback(error, baseRequest.schema);
-      if (attempt === maximumAttempts) throw exhaustedOutputValidation(maximumAttempts, feedback);
+      if (attempt === maximumAttempts)
+        throw exhaustedOutputValidation(maximumAttempts, feedback, usage);
       continue;
     }
     usage = addModelUsage(usage, result.usage);
@@ -490,7 +499,8 @@ export async function reviewWithValidation<T>(
       };
     } catch (error) {
       feedback = boundedValidationFeedback(error);
-      if (attempt === maximumAttempts) throw exhaustedOutputValidation(maximumAttempts, feedback);
+      if (attempt === maximumAttempts)
+        throw exhaustedOutputValidation(maximumAttempts, feedback, usage);
     }
   }
   throw new ModelReviewError("Model validation retry loop exhausted unexpectedly.", {
@@ -499,10 +509,18 @@ export async function reviewWithValidation<T>(
   });
 }
 
-function exhaustedOutputValidation(attempts: number, feedback: string): ModelReviewError {
+function exhaustedOutputValidation(
+  attempts: number,
+  feedback: string,
+  usage: ModelReviewUsage,
+): ModelReviewError {
   return new ModelReviewError(
     `Model output failed adversary validation after ${attempts} attempts: ${feedback}`,
-    { code: "model_validation_failed", retryable: false },
+    {
+      code: "model_validation_failed",
+      retryable: false,
+      ...(usage.inputTokens === undefined && usage.outputTokens === undefined ? {} : { usage }),
+    },
   );
 }
 
@@ -787,7 +805,11 @@ function validateUsage(value: unknown): asserts value is ModelReviewUsage {
   }
 }
 
-function validateModelOutput(schema: Record<string, unknown>, output: unknown): void {
+function validateModelOutput(
+  schema: Record<string, unknown>,
+  output: unknown,
+  usage?: ModelReviewUsage,
+): void {
   const ajv = new Ajv2020({ allErrors: true, strict: true });
   let validate: ReturnType<Ajv2020["compile"]>;
   try {
@@ -802,6 +824,7 @@ function validateModelOutput(schema: Record<string, unknown>, output: unknown): 
     const detail = ajv.errorsText(validate.errors, { separator: "; " });
     throw new ModelReviewError(`Model output does not match the requested schema: ${detail}`, {
       code: "invalid_model_output",
+      ...(usage === undefined ? {} : { usage }),
     });
   }
 }

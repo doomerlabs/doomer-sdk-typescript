@@ -2,7 +2,12 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
-import { BrokerReviewModel, type ModelReviewResult, enhanceReviewModel } from "../src/index.js";
+import {
+  BrokerReviewModel,
+  type ModelReviewResult,
+  type ModelReviewUsage,
+  enhanceReviewModel,
+} from "../src/index.js";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -219,14 +224,15 @@ it.each([
   expect(fetch).toHaveBeenCalledTimes(1);
 });
 
-function reply(output: unknown) {
+function reply(output: unknown, usage?: ModelReviewUsage) {
   return new Response(
-    JSON.stringify({ protocolVersion: 1, provider: "fixture", model: "fixture", output }),
+    JSON.stringify({ protocolVersion: 1, provider: "fixture", model: "fixture", output, usage }),
   );
 }
-function failure(detail: string) {
+function failure(detail: string, usage?: ModelReviewUsage) {
   return new Response(
     JSON.stringify({
+      usage,
       error: {
         code: "invalid_model_output",
         retryable: false,
@@ -236,6 +242,86 @@ function failure(detail: string) {
     { status: 502 },
   );
 }
+
+it.each(["broker", "client", "semantic"] as const)(
+  "aggregates rejected completion usage exactly once before %s repair",
+  async (mode) => {
+    let calls = 0;
+    const validate = vi.fn(({ output }: ModelReviewResult) => {
+      if ((output as { summary: string }).summary === "A substantive but incorrect assessment.")
+        throw new Error("The assessment is incorrect; use the retained evidence.");
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      calls++;
+      if (calls > 1) return reply(valid, { inputTokens: 10, outputTokens: 5 });
+      const usage = { inputTokens: 100, outputTokens: 50 };
+      if (mode === "broker") return failure("maxLength: got 801, want 800", usage);
+      return reply(
+        { summary: mode === "client" ? "short" : "A substantive but incorrect assessment." },
+        usage,
+      );
+    });
+    const model = enhanceReviewModel(
+      new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token", { maximumAttempts: 1 }),
+      process.cwd(),
+    );
+    const result = await model.review({
+      prompt: "Review",
+      input: {},
+      schema,
+      validation: { maximumAttempts: 2, validate },
+    });
+    expect(result.usage).toEqual({ inputTokens: 110, outputTokens: 55 });
+    expect(calls).toBe(2);
+    expect(validate).toHaveBeenCalledTimes(mode === "semantic" ? 2 : 1);
+  },
+);
+
+it.each(["broker", "client"] as const)(
+  "preserves usage on exhausted %s schema repairs",
+  async (mode) => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      const usage = { inputTokens: 100, outputTokens: 50 };
+      return mode === "broker"
+        ? failure("minLength: got 5, want 20", usage)
+        : reply({ summary: "short" }, usage);
+    });
+    const model = enhanceReviewModel(
+      new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token", { maximumAttempts: 1 }),
+      process.cwd(),
+    );
+    await expect(
+      model.review({
+        prompt: "Review",
+        input: {},
+        schema,
+        validation: { maximumAttempts: 2, validate: () => {} },
+      }),
+    ).rejects.toMatchObject({
+      code: "model_validation_failed",
+      usage: { inputTokens: 200, outputTokens: 100 },
+    });
+  },
+);
+
+it("validates usage on broker error envelopes before accounting or repair", async () => {
+  const fetch = vi
+    .spyOn(globalThis, "fetch")
+    .mockResolvedValue(failure("minLength: got 5, want 20", { inputTokens: -1 }));
+  const model = enhanceReviewModel(
+    new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token", { maximumAttempts: 1 }),
+    process.cwd(),
+  );
+  await expect(
+    model.review({
+      prompt: "Review",
+      input: {},
+      schema,
+      validation: { maximumAttempts: 2, validate: () => {} },
+    }),
+  ).rejects.toMatchObject({ code: "invalid_broker_response" });
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
 
 it("schema repairs cannot extend the shared generation deadline", async () => {
   let now = 1000;
