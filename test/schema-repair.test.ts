@@ -536,3 +536,43 @@ it("does not multiply the validation budget for retryable schema envelopes", asy
   });
   expect(fetch).toHaveBeenCalledTimes(2);
 });
+
+it("preserves retryable schema recovery without validation and accounts for every completion", async () => {
+  const payloads: BrokerPayload[] = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+    payloads.push(JSON.parse(String(init?.body)) as BrokerPayload);
+    return payloads.length === 1
+      ? failure("minLength: got 5, want 20", { inputTokens: 100, outputTokens: 50 }, true)
+      : reply(valid, { inputTokens: 10, outputTokens: 5 });
+  });
+  const model = enhanceReviewModel(
+    new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token", {
+      maximumAttempts: 3,
+      initialRetryDelayMs: 0,
+    }),
+    process.cwd(),
+  );
+  const result = await model.review({ prompt: "Review", input: { evidence: "retained" }, schema });
+  expect(payloads).toHaveLength(2);
+  expect(payloads[1]).toEqual(payloads[0]);
+  expect(result.usage).toEqual({ inputTokens: 110, outputTokens: 55 });
+});
+
+it("retains retryable schema usage when recovery without validation is exhausted", async () => {
+  const fetch = vi
+    .spyOn(globalThis, "fetch")
+    .mockImplementation(async () =>
+      failure("minLength: got 5, want 20", { inputTokens: 100, outputTokens: 50 }, true),
+    );
+  const model = new BrokerReviewModel("http://127.0.0.1:43123", "fixture-token", {
+    maximumAttempts: 2,
+    initialRetryDelayMs: 0,
+  });
+  await expect(model.review({ prompt: "Review", input: {}, schema })).rejects.toMatchObject({
+    code: "model_request_recovery_exhausted",
+    retryable: false,
+    diagnostics: { attempts: 2, reason: "attempt_limit" },
+    usage: { inputTokens: 200, outputTokens: 100 },
+  });
+  expect(fetch).toHaveBeenCalledTimes(2);
+});

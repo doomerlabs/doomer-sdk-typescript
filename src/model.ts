@@ -25,6 +25,9 @@ const MAX_BROKER_RETRY_DELAY_MS = 5_000;
 const DEFAULT_VALIDATION_MAXIMUM_ATTEMPTS = 3;
 const MAX_VALIDATION_MAXIMUM_ATTEMPTS = 5;
 const MAX_VALIDATION_FEEDBACK_BYTES = 8 << 10;
+// Internal request metadata survives wrapper spreads but never enters broker JSON.
+const outputRepairRequest = Symbol("sdk.output-repair");
+type OutputRepairRequest = ModelReviewRequest & { [outputRepairRequest]?: true };
 
 // Fetch supplies its own five-minute header timeout, overriding Agent defaults.
 // Override dispatch options for this review only; its shared AbortSignal remains
@@ -271,6 +274,7 @@ export class BrokerReviewModel implements ReviewModel {
       );
     }
     const normalized = normalizeRequest(request);
+    const validationOwnsRetries = (request as OutputRepairRequest)[outputRepairRequest] === true;
     const diagnostics = modelAttemptDiagnostics(
       normalized.budget.timeoutMs,
       request.diagnosticStage === "repository_planning" ? "repository_planning" : "model_review",
@@ -278,6 +282,7 @@ export class BrokerReviewModel implements ReviewModel {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), normalized.budget.timeoutMs);
     const dispatcher = new ModelBrokerDispatcher(normalized.budget.timeoutMs);
+    let usage: ModelReviewUsage = {};
     try {
       for (let attempt = 1; attempt <= this.#maximumAttempts; attempt += 1) {
         const outcome = await this.#reviewAttempt<T>(
@@ -287,18 +292,17 @@ export class BrokerReviewModel implements ReviewModel {
           diagnostics,
           attempt,
         );
-        if (outcome.ok) return outcome.result;
+        if (outcome.ok) return withAccumulatedResultUsage(outcome.result, usage);
         const error = outcome.error;
-        // Schema rejection belongs to the validation loop, even when an older
-        // broker marks it retryable. Transport retries cannot supply repair feedback.
-        if (error instanceof ModelReviewError && error.code === "invalid_model_output") throw error;
-        if (!(error instanceof ModelReviewError) || !error.retryable) throw error;
-        if (controller.signal.aborted) {
-          throw exhaustedModelRecovery(attempt, "deadline");
-        }
-        if (attempt === this.#maximumAttempts) {
+        if (!(error instanceof ModelReviewError)) throw error;
+        // Only an opted-in validation loop takes ownership of schema retries.
+        // Other callers retain the broker's existing retryable-error behavior.
+        if (!error.retryable || (validationOwnsRetries && error.code === "invalid_model_output"))
+          throw error;
+        usage = addModelUsage(usage, error.usage);
+        if (controller.signal.aborted) throw exhaustedModelRecovery(attempt, "deadline");
+        if (attempt === this.#maximumAttempts)
           throw exhaustedModelRecovery(attempt, "attempt_limit");
-        }
         await this.#waitForRetry(
           attempt,
           controller.signal,
@@ -307,6 +311,9 @@ export class BrokerReviewModel implements ReviewModel {
         );
       }
       throw exhaustedModelRecovery(this.#maximumAttempts, "attempt_limit");
+    } catch (error) {
+      if (!(error instanceof ModelReviewError)) throw error;
+      throw withAccumulatedUsage(error, usage);
     } finally {
       clearTimeout(timeout);
       // Cleanup must not replace the typed request error or a successful response.
@@ -521,7 +528,8 @@ async function reviewValidationAttempt<T>(
 ): Promise<OutputValidationAttempt<T>> {
   let result: ModelReviewResult<T>;
   try {
-    result = decorate(await model.review<T>(request));
+    const prepared: OutputRepairRequest = { ...request, [outputRepairRequest]: true };
+    result = decorate(await model.review<T>(prepared));
   } catch (error) {
     if (!(error instanceof ModelReviewError) || error.code !== "invalid_model_output") throw error;
     return {
@@ -536,6 +544,17 @@ async function reviewValidationAttempt<T>(
   } catch (error) {
     return { ok: false, feedback: boundedValidationFeedback(error), usage: result.usage };
   }
+}
+
+function withAccumulatedResultUsage<T>(
+  result: ModelReviewResult<T>,
+  accumulated: ModelReviewUsage,
+): ModelReviewResult<T> {
+  const usage = addModelUsage(accumulated, result.usage);
+  return {
+    ...result,
+    ...(usage.inputTokens === undefined && usage.outputTokens === undefined ? {} : { usage }),
+  };
 }
 
 // Keep interruption classification and metadata intact without mutating an error
