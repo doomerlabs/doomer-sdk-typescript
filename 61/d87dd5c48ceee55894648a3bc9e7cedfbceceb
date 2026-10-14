@@ -1,0 +1,21 @@
+package-lock.json
+  s_902c4820e5fd07::t_2cbf9e0909eeb6 3,9
+package.json
+  s_902c4820e5fd07::t_c30cf333d669d2 3,30-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "61d87dd5c48ceee55894648a3bc9e7cedfbceceb",
+  "prompts": {},
+  "sessions": {
+    "s_902c4820e5fd07": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13823-c2f6-75b3-9978-5851192c2a99",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Marc Campbell <marc.e.campbell@gmail.com>"
+    }
+  }
+}
