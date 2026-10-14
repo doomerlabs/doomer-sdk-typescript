@@ -2156,7 +2156,9 @@ Return only a pure noun phrase that passes validation.`;
  * Build a posture-aware opinion, rewriting free-form concerns via the model when needed.
  *
  * Prefer this over {@link formatOpinion} when the concern may be a model title or clause.
- * Already-valid noun phrases do not trigger a broker call.
+ * Already-valid noun phrases do not trigger a broker call. If both rewrites fail
+ * concern validation, preserve the decision with a generic concern; inference
+ * and transport errors still propagate.
  */
 export async function formatOpinionAsync(
   options: FormatOpinionAsyncOptions,
@@ -2189,13 +2191,24 @@ export async function formatOpinionAsync(
     });
   }
 
-  const rewritten = await rewriteOpinionConcern(options.model, {
-    text: options.concern,
-    ...(options.concernBudget === undefined ? {} : { budget: options.concernBudget }),
-  });
+  let concern: string;
+  try {
+    const rewritten = await rewriteOpinionConcern(options.model, {
+      text: options.concern,
+      ...(options.concernBudget === undefined ? {} : { budget: options.concernBudget }),
+    });
+    concern = rewritten.concern;
+  } catch (error) {
+    if (!(error instanceof ModelReviewError) || error.code !== "invalid_opinion_concern") {
+      throw error;
+    }
+    // A cosmetic rewrite must not discard an otherwise completed review or
+    // change its ship decision. The findings retain the technical explanation.
+    concern = "the reported concern";
+  }
   return formatOpinion({
     ship: options.ship,
-    concern: rewritten.concern,
+    concern,
     remainingCount,
     change: options.change,
     posture: options.posture,

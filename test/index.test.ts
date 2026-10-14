@@ -9,6 +9,7 @@ import {
   Adversary,
   Confidence,
   JsonRenderer,
+  ModelReviewError,
   type ModelReviewRequest,
   type ReviewModel,
   type ReviewPosture,
@@ -508,6 +509,54 @@ describe("review posture and formatOpinion", () => {
     expect(requests).toHaveLength(1);
     expect(requests[0]?.schema).toMatchObject({ required: ["concern"] });
     expect(opinion.summary).toBe("I would address silent no-op v1 paths before shipping.");
+  });
+
+  it.each([false, true])(
+    "preserves ship=%s when both concern rewrites remain clauses",
+    async (ship) => {
+      const requests: ModelReviewRequest[] = [];
+      const model: ReviewModel = {
+        async review<T>(request: ModelReviewRequest) {
+          requests.push(request);
+          return {
+            output: { concern: "commands replace inherited context" } as T,
+            provider: "fixture",
+            model: "concern-rewriter",
+          };
+        },
+      };
+
+      const opinion = await formatOpinionAsync({
+        ship,
+        concern: "commands replace inherited context",
+        posture: "change",
+        model,
+      });
+
+      expect(requests).toHaveLength(2);
+      expect(opinion).toEqual(
+        formatOpinion({ ship, concern: "the reported concern", posture: "change" }),
+      );
+      if (ship) expect(opinion.summary).toContain("follow-up");
+      else expect(opinion.summary).toContain("before merging");
+    },
+  );
+
+  it("does not hide provider failures during opinion rewriting", async () => {
+    const error = new ModelReviewError("provider unavailable", { code: "provider_unavailable" });
+    const model: ReviewModel = {
+      async review() {
+        throw error;
+      },
+    };
+    await expect(
+      formatOpinionAsync({
+        ship: false,
+        concern: "commands replace inherited context",
+        posture: "change",
+        model,
+      }),
+    ).rejects.toBe(error);
   });
 
   it("formatOpinionAsync skips the model when the concern is already valid", async () => {
