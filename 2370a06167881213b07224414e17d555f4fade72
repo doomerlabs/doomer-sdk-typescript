@@ -1,0 +1,21 @@
+src/model.ts
+  s_81653d61acc8bb::t_5426e1c959892e 292-294,474,476-478,485-487,491,493-494,496,500-502,510-540
+test/schema-repair.test.ts
+  s_81653d61acc8bb::t_b7dd227133f4d9 234,240,483-538
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2370a06167881213b07224414e17d555f4fade72",
+  "prompts": {},
+  "sessions": {
+    "s_81653d61acc8bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a13628-d6cb-7363-bc58-4e8e9beb2db7",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Mikhail Swift <mikhail@replicated.com>"
+    }
+  }
+}
