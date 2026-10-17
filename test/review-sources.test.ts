@@ -631,3 +631,22 @@ it("does not add sourceIds to deduplicated legacy findings", async () => {
   expect(result.findings).toHaveLength(1);
   expect(result.findings[0]).not.toHaveProperty("sourceIds");
 });
+
+it("does not add sourceIds to source-free observation findings", async () => {
+  const app = new Adversary({ name: "legacy-observations" });
+  app.rule("legacy", (ctx) =>
+    ctx.observe({
+      ruleId: "legacy",
+      subject: "ci.yml",
+      title: "Finding",
+      summary: "Details",
+      category: "ci",
+      severity: "high",
+      confidence: "high",
+      location: { file: "ci.yml", line: 1 },
+    }),
+  );
+  const result = await app.run({ input: { source: { path: process.cwd() } } });
+  expect(result.findings).toHaveLength(1);
+  expect(result.findings[0]).not.toHaveProperty("sourceIds");
+});

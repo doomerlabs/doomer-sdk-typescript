@@ -1816,9 +1816,9 @@ function synthesizeObservationFindings(
       remediation: synthesis.remediation ?? first.remediation,
       tags: synthesis.tags ?? uniqueStrings(group.flatMap((observation) => observation.tags ?? [])),
       metadata: synthesis.metadata ?? first.metadata,
-      sourceIds: group.some((item) => item.sourceIds?.length)
-        ? uniqueStrings(group.flatMap((item) => item.sourceIds ?? []))
-        : undefined,
+      ...(group.some((item) => item.sourceIds?.length)
+        ? { sourceIds: uniqueStrings(group.flatMap((item) => item.sourceIds ?? [])) }
+        : {}),
     };
     assertFindingInput(finding, `adversary aggregate rule "${first.ruleId}"`);
     return finding;
