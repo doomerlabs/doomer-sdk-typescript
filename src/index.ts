@@ -20,8 +20,10 @@ import { type RepoIndex, repoIndexFromEnvironment } from "./repo-index.js";
 import { reviewWithRepositoryTools } from "./repository-model.js";
 import {
   type ReviewSource,
+  ReviewSourceCapacityError,
   ReviewSourceValidationError,
   normalizeReviewSource,
+  parseReviewSourceUrl,
   validateReviewSourceBudget,
   validateSourceIds,
 } from "./review-sources.js";
@@ -36,6 +38,7 @@ import {
 export {
   REVIEW_SOURCE_STATUSES,
   ReviewSourceValidationError,
+  ReviewSourceCapacityError,
   type ReviewSource,
 } from "./review-sources.js";
 
@@ -1018,17 +1021,31 @@ export async function writeOutput(
   await writeFile(path, `${JSON.stringify(output, null, 2)}\n`, "utf8");
 }
 
-export async function validateRunEnvelope(output: unknown): Promise<void> {
-  if (isRecord(output) && isRecord(output.result)) {
-    for (const field of ["findings", "suppressedFindings"] as const) {
-      const findings = output.result[field];
-      if (!Array.isArray(findings)) continue;
-      for (const [index, finding] of findings.entries()) {
-        if (isRecord(finding))
-          validateSourceIds(finding.sourceIds, `result.${field}[${index}].sourceIds`);
-      }
+function validateEnvelopeSourceInputs(output: unknown): void {
+  if (!isRecord(output) || !isRecord(output.result)) return;
+  const result = output.result;
+  if (Array.isArray(result.sources)) {
+    for (const [index, source] of result.sources.entries()) {
+      if (isRecord(source) && source.url !== undefined)
+        parseReviewSourceUrl(
+          source.url,
+          `result.sources[${index}].url`,
+          typeof source.id === "string" ? source.id : undefined,
+        );
     }
   }
+  for (const field of ["findings", "suppressedFindings"] as const) {
+    const findings = result[field];
+    if (!Array.isArray(findings)) continue;
+    for (const [index, finding] of findings.entries()) {
+      if (isRecord(finding))
+        validateSourceIds(finding.sourceIds, `result.${field}[${index}].sourceIds`);
+    }
+  }
+}
+
+export async function validateRunEnvelope(output: unknown): Promise<void> {
+  validateEnvelopeSourceInputs(output);
   let validator = envelopeValidator;
   if (validator === undefined) {
     const schema = JSON.parse(
@@ -1392,11 +1409,7 @@ function createRuleContext(
       source(source: ReviewSource): void {
         const normalized = normalizeReviewSource(source, "ctx.review.source");
         if (!collector.sources.has(normalized.id) && collector.sources.size >= 32)
-          throw new ReviewSourceValidationError(
-            "ctx.review.source",
-            "at most 32 sources are allowed",
-            normalized.id,
-          );
+          throw new ReviewSourceCapacityError(normalized.id);
         collector.sources.set(normalized.id, normalized);
       },
       incomplete(reason: ReviewIncompleteReason): void {
@@ -1543,6 +1556,7 @@ function buildReviewResult(input: {
   includeRawObservations?: boolean;
   timing?: ReviewResult["timing"];
 }): ReviewResult {
+  assertCollectedSourceReferences(input.collector);
   const thresholds = input.policy.confidenceThresholds ?? DEFAULT_CONFIDENCE_THRESHOLDS;
   const synthesis = synthesizeObservationFindings(
     input.collector.observations,
@@ -1553,7 +1567,6 @@ function buildReviewResult(input: {
     ...synthesis.findings.map((finding) => ({ finding, deduplicate: true })),
     ...input.collector.findings,
   ]).map((finding) => calibrateFindingSeverity(finding, input.policy));
-  assertFindingSourceReferences(allFindings, input.collector.sources);
   const ranked = rankFindings(allFindings);
   const minimumConfidence = input.policy.minimumConfidence ?? Confidence.Medium;
   const includeInformational = input.policy.includeInformational ?? false;
@@ -1610,6 +1623,21 @@ function buildReviewResult(input: {
     suppressedFindings: input.includeSuppressed ? suppressedFindings : undefined,
     rawObservations: input.includeRawObservations ? input.collector.observations : undefined,
   }) as ReviewResult;
+}
+
+function assertCollectedSourceReferences(collector: ReviewCollector): void {
+  for (const observation of collector.observations)
+    assertFindingSourceReferences(
+      [observation],
+      collector.sources,
+      `ctx.observe (rule ${observation.ruleId})`,
+    );
+  for (const { finding } of collector.findings)
+    assertFindingSourceReferences(
+      [finding],
+      collector.sources,
+      finding.ruleId ? `ctx.finding (rule ${finding.ruleId})` : "ctx.finding",
+    );
 }
 
 function assertFindingSourceReferences(

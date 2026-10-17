@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { Adversary, createAdversaryRunEnvelope, validateRunEnvelope } from "../src/index.js";
 import {
+  Adversary,
   type ReviewSource,
+  ReviewSourceCapacityError,
   ReviewSourceValidationError,
-  normalizeReviewSource,
-} from "../src/review-sources.js";
+  createAdversaryRunEnvelope,
+  validateRunEnvelope,
+} from "../src/index.js";
+import { normalizeReviewSource } from "../src/review-sources.js";
 
 const source: ReviewSource = {
   id: "actionlint",
@@ -343,7 +346,68 @@ describe("source contract boundary regressions", () => {
     });
     await expect(app.run({ input: { source: { path: process.cwd() } } })).rejects.toMatchObject({
       field: "ctx.review.source",
-      code: "invalid_review_source",
+      code: "review_source_capacity_exceeded",
     });
+  });
+});
+
+describe("source error policy", () => {
+  it("preserves specific typed URL and data rejection reasons", () => {
+    expect(() =>
+      normalizeReviewSource({ ...source, url: "https://user:pass@example.com" }),
+    ).toThrow("without credentials");
+    expect(() =>
+      normalizeReviewSource({ ...source, url: `https://example.com/${"x".repeat(2100)}` }),
+    ).toThrow("must be at most 2000 characters");
+    expect(() =>
+      normalizeReviewSource({ ...source, data: { toJSON: () => "not an object" } }),
+    ).toThrow("must serialize to an object");
+  });
+
+  it("enforces the same URL policy on raw envelopes", async () => {
+    const result = await new Adversary({ name: "raw-url" }).run({
+      input: { source: { path: process.cwd() } },
+    });
+    for (const url of [
+      "https://user:pass@example.com",
+      "http://user@example.com",
+      "javascript:alert(1)",
+    ]) {
+      const envelope = createAdversaryRunEnvelope(result);
+      envelope.result.sources = [{ ...source, url }];
+      await expect(validateRunEnvelope(envelope)).rejects.toMatchObject({
+        name: "ReviewSourceValidationError",
+        field: "result.sources[0].url",
+      });
+    }
+  });
+
+  it("anchors deferred reference errors to the original caller and rule", async () => {
+    for (const method of ["finding", "observe"] as const) {
+      const app = new Adversary({ name: "source-caller" });
+      app.rule("sources", (ctx) =>
+        ctx[method]({
+          ruleId: "sources",
+          subject: "ci.yml",
+          title: "Finding",
+          summary: "Details",
+          category: "ci",
+          severity: "high",
+          confidence: "high",
+          evidence: [{ file: "ci.yml", line: 1 }],
+          sourceIds: ["missing"],
+        } as never),
+      );
+      await expect(app.run({ input: { source: { path: process.cwd() } } })).rejects.toMatchObject({
+        field: `ctx.${method} (rule sources)[0].sourceIds`,
+        sourceId: "missing",
+      });
+    }
+  });
+
+  it("exports a distinct capacity error on the public SDK surface", () => {
+    const error = new ReviewSourceCapacityError("extra");
+    expect(error).toBeInstanceOf(ReviewSourceValidationError);
+    expect(error.code).toBe("review_source_capacity_exceeded");
   });
 });

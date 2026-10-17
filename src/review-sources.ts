@@ -34,7 +34,7 @@ const secretAssignment = new RegExp(
 );
 
 export class ReviewSourceValidationError extends Error {
-  readonly code = "invalid_review_source";
+  readonly code: string = "invalid_review_source";
   constructor(
     readonly field: string,
     detail: string,
@@ -43,6 +43,32 @@ export class ReviewSourceValidationError extends Error {
     super(`${field}${sourceId ? ` (source ${sourceId})` : ""}: ${detail}`);
     this.name = "ReviewSourceValidationError";
   }
+}
+
+export class ReviewSourceCapacityError extends ReviewSourceValidationError {
+  override readonly code = "review_source_capacity_exceeded";
+  constructor(sourceId: string) {
+    super("ctx.review.source", "at most 32 sources are allowed", sourceId);
+    this.name = "ReviewSourceCapacityError";
+  }
+}
+
+export function parseReviewSourceUrl(value: unknown, field: string, sourceId?: string): URL {
+  if (typeof value !== "string")
+    throw new ReviewSourceValidationError(field, "must be an HTTP(S) URL", sourceId);
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new ReviewSourceValidationError(field, "must be a valid HTTP(S) URL", sourceId);
+  }
+  if (!["https:", "http:"].includes(url.protocol) || url.username || url.password)
+    throw new ReviewSourceValidationError(
+      field,
+      "must be an HTTP(S) URL without credentials",
+      sourceId,
+    );
+  return url;
 }
 
 function redact(text: string): string {
@@ -140,7 +166,8 @@ export function normalizeReviewSource(input: ReviewSource, label = "reviewSource
       const parsed: unknown = JSON.parse(serialized);
       if (!parsed || Array.isArray(parsed) || typeof parsed !== "object")
         fail("data", "must serialize to an object");
-    } catch {
+    } catch (error) {
+      if (error instanceof ReviewSourceValidationError) throw error;
       fail("data", "must be a JSON-serializable object (received object)");
     }
     if (Buffer.byteLength(serialized) + Buffer.byteLength(result.output ?? "") > 32768)
@@ -159,9 +186,7 @@ export function normalizeReviewSource(input: ReviewSource, label = "reviewSource
   if (input.url !== undefined) {
     if (typeof input.url !== "string") fail("url", "must be an HTTP(S) URL without credentials");
     try {
-      const url = new URL(input.url);
-      if (!["https:", "http:"].includes(url.protocol) || url.username || url.password)
-        fail("url", "must be an HTTP(S) URL without credentials");
+      const url = parseReviewSourceUrl(input.url, `${label}.url`, safeId);
       const params = new URLSearchParams();
       for (const [key, value] of url.searchParams) {
         params.append(key, secretKey.test(key) ? "[REDACTED]" : redact(value));
@@ -171,7 +196,8 @@ export function normalizeReviewSource(input: ReviewSource, label = "reviewSource
       if (url.hash) url.hash = `#${redactUrlComponent(url.hash.slice(1))}`;
       result.url = url.toString();
       if (result.url.length > 2000) fail("url", "must be at most 2000 characters");
-    } catch {
+    } catch (error) {
+      if (error instanceof ReviewSourceValidationError) throw error;
       fail("url", "must be a valid HTTP(S) URL without credentials, at most 2000 characters");
     }
   }

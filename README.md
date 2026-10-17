@@ -1282,7 +1282,9 @@ in active and suppressed findings; the constructor deduplicates valid references
 Invalid source metadata throws `ReviewSourceValidationError` (exported by the
 SDK) with code `invalid_review_source`, a field label such as
 `ctx.review.source.url`, and the source ID when it is valid. Parser failures do
-not include raw URLs or credential values in error messages.
+not include raw URLs or credential values in error messages. Exceeding the
+32-source limit throws `ReviewSourceCapacityError` with code
+`review_source_capacity_exceeded`.
 
 **Remove secrets before reporting any output or URL.** The SDK additionally
 redacts common credential keys, assignments and bearer tokens, but this cannot
