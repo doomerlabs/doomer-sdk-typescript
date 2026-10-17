@@ -595,6 +595,8 @@ it("composes Bearer and assignment redaction without exposing the assignment val
     "Bearer\tGITHUB_TOKEN=hunter2",
     "Bearer ghp_abc was revoked",
     "Bearer abc123== (expired)",
+    "Bearer\n  ghp_abc",
+    "Bearer\r\n\tghp_abc was revoked",
   ]) {
     const result = normalizeReviewSource({
       ...source,

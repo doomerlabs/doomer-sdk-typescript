@@ -79,7 +79,7 @@ function redact(text: string): string {
   // Hide assignment values first so a Bearer mention cannot consume their keys.
   return text
     .replace(secretAssignment, '$1"[REDACTED]"')
-    .replace(/(Bearer[ \t]+)[A-Za-z0-9._~+\/-]+=*(?![A-Za-z0-9._~+\/=-])/gi, "$1[REDACTED]");
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]+=*(?![A-Za-z0-9._~+\/=-])/gi, "$1[REDACTED]");
 }
 
 /** JSON Schema limits characters; the wire validator also enforces this shared UTF-8 budget. */
