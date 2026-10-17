@@ -1021,26 +1021,28 @@ export async function writeOutput(
   await writeFile(path, `${JSON.stringify(output, null, 2)}\n`, "utf8");
 }
 
+function validateWireSourceUrl(source: unknown, index: number): void {
+  if (!isRecord(source) || source.url === undefined) return;
+  parseReviewSourceUrl(
+    source.url,
+    `result.sources[${index}].url`,
+    typeof source.id === "string" ? source.id : undefined,
+  );
+}
+
+function validateWireFindingSourceIds(finding: unknown, index: number, field: string): void {
+  if (!isRecord(finding)) return;
+  validateSourceIds(finding.sourceIds, `result.${field}[${index}].sourceIds`);
+}
+
 function validateEnvelopeSourceInputs(output: unknown): void {
   if (!isRecord(output) || !isRecord(output.result)) return;
   const result = output.result;
-  if (Array.isArray(result.sources)) {
-    for (const [index, source] of result.sources.entries()) {
-      if (isRecord(source) && source.url !== undefined)
-        parseReviewSourceUrl(
-          source.url,
-          `result.sources[${index}].url`,
-          typeof source.id === "string" ? source.id : undefined,
-        );
-    }
-  }
+  if (Array.isArray(result.sources)) result.sources.forEach(validateWireSourceUrl);
   for (const field of ["findings", "suppressedFindings"] as const) {
     const findings = result[field];
     if (!Array.isArray(findings)) continue;
-    for (const [index, finding] of findings.entries()) {
-      if (isRecord(finding))
-        validateSourceIds(finding.sourceIds, `result.${field}[${index}].sourceIds`);
-    }
+    findings.forEach((finding, index) => validateWireFindingSourceIds(finding, index, field));
   }
 }
 
@@ -1062,8 +1064,8 @@ export async function validateRunEnvelope(output: unknown): Promise<void> {
   }
   const result = (output as AdversaryRunEnvelope).result;
   assertResultSourceReferences(result, result.sources ?? []);
-  for (const source of result.sources ?? []) {
-    validateReviewSourceBudget(source, "result.sources");
+  for (const [index, source] of (result.sources ?? []).entries()) {
+    validateReviewSourceBudget(source, `result.sources[${index}]`);
   }
 }
 
@@ -1626,32 +1628,37 @@ function buildReviewResult(input: {
 }
 
 function assertCollectedSourceReferences(collector: ReviewCollector): void {
-  for (const observation of collector.observations)
-    assertFindingSourceReferences(
-      [observation],
+  for (const [index, observation] of collector.observations.entries())
+    assertSourceReferences(
+      observation.sourceIds,
       collector.sources,
-      `ctx.observe (rule ${observation.ruleId})`,
+      `ctx.observe (rule ${observation.ruleId})[${index}].sourceIds`,
     );
-  for (const { finding } of collector.findings)
-    assertFindingSourceReferences(
-      [finding],
-      collector.sources,
-      finding.ruleId ? `ctx.finding (rule ${finding.ruleId})` : "ctx.finding",
-    );
+  for (const [index, { finding }] of collector.findings.entries()) {
+    const caller = finding.ruleId ? `ctx.finding (rule ${finding.ruleId})` : "ctx.finding";
+    assertSourceReferences(finding.sourceIds, collector.sources, `${caller}[${index}].sourceIds`);
+  }
+}
+
+function assertSourceReferences(
+  sourceIds: unknown,
+  sources: Map<string, ReviewSource>,
+  field: string,
+): void {
+  validateSourceIds(sourceIds, field);
+  const unknown = sourceIds?.find((id) => !sources.has(id));
+  if (unknown !== undefined)
+    throw new ReviewSourceValidationError(field, "Unknown review source", unknown);
 }
 
 function assertFindingSourceReferences(
   findings: Pick<ReviewFinding, "sourceIds">[],
   sources: Map<string, ReviewSource>,
-  label = "finding",
+  label: string,
 ): void {
-  for (const [index, finding] of findings.entries()) {
-    const field = `${label}[${index}].sourceIds`;
-    validateSourceIds(finding.sourceIds, field);
-    const unknown = finding.sourceIds?.find((id) => !sources.has(id));
-    if (unknown !== undefined)
-      throw new ReviewSourceValidationError(field, "Unknown review source", unknown);
-  }
+  findings.forEach((finding, index) =>
+    assertSourceReferences(finding.sourceIds, sources, `${label}[${index}].sourceIds`),
+  );
 }
 
 function assertResultSourceReferences(
@@ -1842,6 +1849,14 @@ function normalizeFindingInput(input: FindingInput, occurrence = 0): ReviewFindi
   }) as ReviewFinding;
 }
 
+function mergeSourceIds(
+  left: string[] | undefined,
+  right: string[] | undefined,
+): string[] | undefined {
+  if (!left?.length && !right?.length) return left;
+  return uniqueStrings([...(left ?? []), ...(right ?? [])]);
+}
+
 function deduplicateFindings(findings: CollectedFinding[]): ReviewFinding[] {
   const seen = new Set<string>();
   const result: ReviewFinding[] = [];
@@ -1857,11 +1872,7 @@ function deduplicateFindings(findings: CollectedFinding[]): ReviewFinding[] {
       const existing = result.find((item) => (item.groupKey ?? item.id) === key);
       if (existing !== undefined) {
         existing.evidence = deduplicateEvidence([...existing.evidence, ...finding.evidence]);
-        if (existing.sourceIds?.length || finding.sourceIds?.length)
-          existing.sourceIds = uniqueStrings([
-            ...(existing.sourceIds ?? []),
-            ...(finding.sourceIds ?? []),
-          ]);
+        existing.sourceIds = mergeSourceIds(existing.sourceIds, finding.sourceIds);
         existing.tags = uniqueStrings([...(existing.tags ?? []), ...(finding.tags ?? [])]);
       }
       continue;

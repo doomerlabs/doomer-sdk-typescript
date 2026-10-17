@@ -274,7 +274,7 @@ describe("source contract boundary regressions", () => {
       await expect(validateRunEnvelope(envelope)).rejects.toMatchObject({
         name: "ReviewSourceValidationError",
         code: "invalid_review_source",
-        field: "result.sources.data",
+        field: "result.sources[0].data",
         sourceId: source.id,
       });
     }
@@ -410,4 +410,44 @@ describe("source error policy", () => {
     expect(error).toBeInstanceOf(ReviewSourceValidationError);
     expect(error.code).toBe("review_source_capacity_exceeded");
   });
+});
+
+it("reports the actual position of later invalid source references", async () => {
+  for (const method of ["finding", "observe"] as const) {
+    const app = new Adversary({ name: "later-reference" });
+    app.rule("sources", (ctx) => {
+      ctx.review.source(source);
+      for (const id of [source.id, "missing"])
+        ctx[method]({
+          ruleId: "sources",
+          subject: "ci.yml",
+          title: "Finding",
+          summary: "Details",
+          category: "ci",
+          severity: "high",
+          confidence: "high",
+          evidence: [{ file: "ci.yml", line: 1 }],
+          sourceIds: [id],
+        } as never);
+    });
+    await expect(app.run({ input: { source: { path: process.cwd() } } })).rejects.toMatchObject({
+      field: `ctx.${method} (rule sources)[1].sourceIds`,
+      sourceId: "missing",
+    });
+  }
+});
+
+it("identifies later sources in wire serialization and byte-budget errors", async () => {
+  const result = await new Adversary({ name: "later-source" }).run({
+    input: { source: { path: process.cwd() } },
+  });
+  for (const data of [{ value: 1n }, { value: "x".repeat(40000) }]) {
+    const envelope = createAdversaryRunEnvelope(result);
+    envelope.result.sources = [source, { ...source, id: "second", data }];
+    await expect(validateRunEnvelope(envelope)).rejects.toMatchObject({
+      field:
+        typeof data.value === "bigint" ? "result.sources[1].data" : "result.sources[1].data/output",
+      sourceId: "second",
+    });
+  }
 });
