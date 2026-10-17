@@ -1,0 +1,29 @@
+README.md
+  s_b2af389a952e96::t_e522bd2e1bdd2f 1276-1284
+schemas/adversary.review.v1.schema.json
+  s_b2af389a952e96::t_9c67d749eba256 14
+src/index.ts
+  s_b2af389a952e96::t_39f31f67bb5c69 21-26,35-40,875,1033-1035,1378,1380-1384,1541,1562,1600-1625,2966,2987
+src/review-sources.ts
+  s_b2af389a952e96::t_d62df77525d86e 1-8,14,26-46,50-63,67-77,79-80,89-91,96-97,99,101,104-115,120-122,124-125,127,130-148
+test/protocol-contract.test.ts
+  s_b2af389a952e96::t_9aa88cb0e220d7 167
+test/review-sources.test.ts
+  s_b2af389a952e96::t_360373c5423a41 3-7,46,112-217
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4cca9fcf8d67708d4f777017f4889028fed49a82",
+  "prompts": {},
+  "sessions": {
+    "s_b2af389a952e96": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a14620-94cd-7443-8352-8c9a8de878d4",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Marc Campbell <marc.e.campbell@gmail.com>"
+    }
+  }
+}
