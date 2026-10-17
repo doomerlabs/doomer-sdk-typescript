@@ -29,8 +29,8 @@ const secretNames =
 const credentialName = `(?:[a-z0-9]+[_-])*(?:${secretNames})`;
 const secretKey = new RegExp(`^${credentialName}$`, "i");
 const secretAssignment = new RegExp(
-  `((?<![\\w-])["']?${credentialName}["']?\\s*[=:]\\s*)(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Basic|Bearer)\\s+[^\\s,;]+|[^\\s,;]+)(?=\\s*(?:$|[,;\\r\\n}\\]]))`,
-  "gim",
+  `((?<![\\w-])["']?${credentialName}["']?\\s*[=:]\\s*)(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Basic|Bearer)\\s+[^\\s,;]+|[^\\s,;]+)`,
+  "gi",
 );
 
 export class ReviewSourceValidationError extends Error {
@@ -77,7 +77,7 @@ export function parseReviewSourceUrl(value: unknown, field: string, sourceId?: s
 
 function redact(text: string): string {
   return text
-    .replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]+=*(?=$|[\r\n"',;])/gim, "$1[REDACTED]")
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]+=*/gi, "$1[REDACTED]")
     .replace(secretAssignment, '$1"[REDACTED]"');
 }
 

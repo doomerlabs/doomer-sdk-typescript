@@ -498,7 +498,7 @@ it("indexes source normalization errors and omits invalid IDs from URL diagnosti
   }
 });
 
-it("preserves benign display text and prose while scrubbing raw credentials", () => {
+it("preserves benign display metadata while scrubbing raw credentials", () => {
   const text = "Bearer token required for API access; token: rotation pending";
   const result = normalizeReviewSource({
     ...source,
@@ -512,7 +512,6 @@ it("preserves benign display text and prose while scrubbing raw credentials", ()
   expect(result.summary).toBe(text);
   expect(result.kind).toBe("token: rotation pending");
   expect(result.scope).toEqual(["secret: rotation pending"]);
-  expect(result.output).toContain(text);
   expect(result.output).not.toContain("hunter2");
 });
 
@@ -564,4 +563,26 @@ it("records a machine-readable context reason for incomplete sources", async () 
   expect(
     result.observations.find((note) => note.key === "code-review.coverage-gap.sources")?.metadata,
   ).toMatchObject({ role: "context", incomplete: true, reason: "source_coverage" });
+});
+
+it("redacts credentials followed by inline text across raw output, data and URLs", () => {
+  for (const text of [
+    "token: abc123 # rotated",
+    "password=hunter2 (see run 4)",
+    "Bearer ghp_abc was revoked",
+    '"password": "hunter2" rest',
+  ]) {
+    const result = normalizeReviewSource({
+      ...source,
+      output: text,
+      data: { note: text },
+      url: `https://example.com/${encodeURIComponent(text)}?note=${encodeURIComponent(text)}#${encodeURIComponent(text)}`,
+    });
+    for (const secret of ["abc123", "hunter2", "ghp_abc"]) {
+      expect(result.output).not.toContain(secret);
+      expect(JSON.stringify(result.data)).not.toContain(secret);
+      expect(result.url).not.toContain(secret);
+    }
+    expect(result.output).toContain("[REDACTED]");
+  }
 });
