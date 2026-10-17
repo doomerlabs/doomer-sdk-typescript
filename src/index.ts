@@ -1,5 +1,5 @@
-import { normalizeReviewSource, type ReviewSource } from "./review-sources.js";
-export { type ReviewSource } from "./review-sources.js";
+import { type ReviewSource, normalizeReviewSource } from "./review-sources.js";
+export type { ReviewSource } from "./review-sources.js";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";

@@ -13,13 +13,7 @@
     "reviewSource": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "id",
-        "kind",
-        "title",
-        "status",
-        "summary"
-      ],
+      "required": ["id", "kind", "title", "status", "summary"],
       "properties": {
         "id": {
           "type": "string",
@@ -36,13 +30,7 @@
           "maxLength": 200
         },
         "status": {
-          "enum": [
-            "passed",
-            "findings",
-            "error",
-            "partial",
-            "unavailable"
-          ]
+          "enum": ["passed", "findings", "error", "partial", "unavailable"]
         },
         "summary": {
           "type": "string",
@@ -133,7 +121,12 @@
       "additionalProperties": false,
       "required": ["id", "title", "category", "severity", "confidence", "summary", "evidence"],
       "properties": {
-        "sourceIds": {"type": "array", "maxItems": 256, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"}},
+        "sourceIds": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" }
+        },
         "id": { "type": "string", "minLength": 1, "pattern": "\\S" },
         "ruleId": { "type": "string" },
         "groupKey": { "type": "string" },
@@ -163,7 +156,11 @@
       "additionalProperties": false,
       "required": ["adversary", "target", "positives", "observations", "findings", "suppressed"],
       "properties": {
-        "sources": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/reviewSource"}},
+        "sources": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/reviewSource" }
+        },
         "adversary": { "$ref": "#/$defs/adversary" },
         "target": { "$ref": "#/$defs/target" },
         "assessment": {

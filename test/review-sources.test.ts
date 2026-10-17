@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Adversary, createAdversaryRunEnvelope, validateRunEnvelope } from "../src/index.js";
-import { normalizeReviewSource, type ReviewSource } from "../src/review-sources.js";
+import { type ReviewSource, normalizeReviewSource } from "../src/review-sources.js";
 
 const source: ReviewSource = {
   id: "actionlint",
@@ -63,10 +63,10 @@ describe("review evidence sources", () => {
   it("bounds UTF-8 output, marks truncation and removes common secrets", () => {
     const result = normalizeReviewSource({
       ...source,
-      output: "Bearer abc.def\npassword=topsecret\n" + "λ".repeat(40000),
+      output: `Bearer abc.def\npassword=topsecret\n${"λ".repeat(40000)}`,
       data: { token: "secret" },
     });
-    expect(Buffer.byteLength(result.output!)).toBeLessThanOrEqual(32768);
+    expect(Buffer.byteLength(result.output ?? "")).toBeLessThanOrEqual(32768);
     expect(result.truncated).toBe(true);
     expect(result.output).not.toContain("topsecret");
     expect(result.output).not.toContain("abc.def");
