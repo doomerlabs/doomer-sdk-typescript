@@ -77,7 +77,7 @@ describe("review evidence sources", () => {
     expect(result.truncated).toBe(true);
     expect(result.output).not.toContain("topsecret");
     expect(result.output).not.toContain("abc.def");
-    expect(result.data).toBeUndefined();
+    expect(result.data).toEqual({ token: "[REDACTED]" });
     expect(
       normalizeReviewSource({ ...source, data: { nested: { api_key: "secret" }, count: 3 } }).data,
     ).toEqual({ nested: { api_key: "[REDACTED]" }, count: 3 });
@@ -449,5 +449,51 @@ it("identifies later sources in wire serialization and byte-budget errors", asyn
         typeof data.value === "bigint" ? "result.sources[1].data" : "result.sources[1].data/output",
       sourceId: "second",
     });
+  }
+});
+
+it("keeps structured evidence by shortening UTF-8 output to the remaining budget", () => {
+  for (const data of [{ count: 3 }, { value: "x".repeat(32756) }, { value: "x".repeat(40000) }]) {
+    const result = normalizeReviewSource({ ...source, output: "λ".repeat(40000), data });
+    const dataBytes = Buffer.byteLength(JSON.stringify(data));
+    expect(result.data).toEqual(dataBytes <= 32768 ? data : undefined);
+    expect(
+      Buffer.byteLength(result.output ?? "") + Buffer.byteLength(JSON.stringify(result.data) ?? ""),
+    ).toBeLessThanOrEqual(32768);
+    expect(result.output).not.toContain("\uFFFD");
+    expect(result.truncated).toBe(true);
+  }
+});
+
+it("rejects duplicate source IDs at construction and raw wire boundaries", async () => {
+  const result = await new Adversary({ name: "duplicate-sources" }).run({
+    input: { source: { path: process.cwd() } },
+  });
+  result.sources = [source, { ...source, summary: "Updated invocation" }];
+  expect(() => createAdversaryRunEnvelope(result)).toThrow("duplicate source ID");
+  const envelope = createAdversaryRunEnvelope({ ...result, sources: [] });
+  envelope.result.sources = result.sources;
+  await expect(validateRunEnvelope(envelope)).rejects.toMatchObject({
+    field: "result.sources[1].id",
+    sourceId: source.id,
+  });
+});
+
+it("indexes source normalization errors and omits invalid IDs from URL diagnostics", async () => {
+  const result = await new Adversary({ name: "safe-id" }).run({
+    input: { source: { path: process.cwd() } },
+  });
+  const invalid = { ...source, id: "password=private-value", url: "https://user:pass@example.com" };
+  result.sources = [source, invalid];
+  expect(() => createAdversaryRunEnvelope(result)).toThrow("result.sources[1].id");
+  const envelope = createAdversaryRunEnvelope({ ...result, sources: [] });
+  envelope.result.sources = result.sources;
+  try {
+    await validateRunEnvelope(envelope);
+    throw new Error("expected rejection");
+  } catch (error) {
+    expect(error).toBeInstanceOf(ReviewSourceValidationError);
+    expect(error).toMatchObject({ field: "result.sources[1].url", sourceId: undefined });
+    expect((error as Error).message).not.toContain("private-value");
   }
 });

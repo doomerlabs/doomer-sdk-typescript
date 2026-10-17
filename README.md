@@ -1270,14 +1270,16 @@ as passed. Missing evidence should still be reported using the appropriate
 status; the platform records incomplete source coverage separately from findings.
 
 The SDK accepts at most 32 sources per run. Source text and structured output
-share a 32 KiB UTF-8 budget; oversized structured data is omitted rather than
-serialized as broken JSON. `truncated` is set whenever output or metadata is
+share a 32 KiB UTF-8 budget. Structured data that fits is retained, shortening
+text output to the remaining budget. Data larger than the entire budget is
+omitted rather than serialized as broken JSON. `truncated` is set whenever output or metadata is
 shortened. Source titles, summaries and scope also have bounded lengths. The
 combined protocol supports up to 256 sources. `createAdversaryRunEnvelope` also
 normalizes sources in manually constructed results, and `validateRunEnvelope`
 enforces the combined output/data byte budget in addition to JSON Schema's
 character limits. Both helpers also reject dangling or malformed source IDs
-in active and suppressed findings; the constructor deduplicates valid references.
+in active and suppressed findings, and reject duplicate source IDs. The
+constructor deduplicates valid finding references.
 
 Invalid source metadata throws `ReviewSourceValidationError` (exported by the
 SDK) with code `invalid_review_source`, a field label such as

@@ -869,7 +869,9 @@ export function createAdversaryRunEnvelope(result: ReviewResult): AdversaryRunEn
 }
 
 function toWireReviewResult(result: ReviewResult): WireReviewResult {
-  const sources = result.sources?.map((source) => normalizeReviewSource(source, "result.sources"));
+  const sources = result.sources?.map((source, index) =>
+    normalizeReviewSource(source, `result.sources[${index}]`),
+  );
   assertResultSourceReferences(result, sources ?? []);
   return omitUndefined({
     adversary: omitUndefined(result.adversary),
@@ -1665,7 +1667,16 @@ function assertResultSourceReferences(
   result: Pick<ReviewResult, "findings" | "suppressedFindings">,
   sources: ReviewSource[],
 ): void {
-  const byId = new Map(sources.map((source) => [source.id, source]));
+  const byId = new Map<string, ReviewSource>();
+  for (const [index, source] of sources.entries()) {
+    if (byId.has(source.id))
+      throw new ReviewSourceValidationError(
+        `result.sources[${index}].id`,
+        "duplicate source ID",
+        source.id,
+      );
+    byId.set(source.id, source);
+  }
   assertFindingSourceReferences(result.findings, byId, "result.findings");
   assertFindingSourceReferences(result.suppressedFindings ?? [], byId, "result.suppressedFindings");
 }

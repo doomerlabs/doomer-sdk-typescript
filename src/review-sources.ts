@@ -35,12 +35,16 @@ const secretAssignment = new RegExp(
 
 export class ReviewSourceValidationError extends Error {
   readonly code: string = "invalid_review_source";
+  readonly sourceId?: string;
   constructor(
     readonly field: string,
     detail: string,
-    readonly sourceId?: string,
+    sourceId?: string,
   ) {
-    super(`${field}${sourceId ? ` (source ${sourceId})` : ""}: ${detail}`);
+    const safeId =
+      typeof sourceId === "string" && sourceIdPattern.test(sourceId) ? sourceId : undefined;
+    super(`${field}${safeId ? ` (source ${safeId})` : ""}: ${detail}`);
+    this.sourceId = safeId;
     this.name = "ReviewSourceValidationError";
   }
 }
@@ -170,9 +174,14 @@ export function normalizeReviewSource(input: ReviewSource, label = "reviewSource
       if (error instanceof ReviewSourceValidationError) throw error;
       fail("data", "must be a JSON-serializable object (received object)");
     }
-    if (Buffer.byteLength(serialized) + Buffer.byteLength(result.output ?? "") > 32768)
+    const dataBytes = Buffer.byteLength(serialized);
+    if (dataBytes > 32768) {
       truncated = true;
-    else result.data = JSON.parse(serialized);
+    } else {
+      result.data = JSON.parse(serialized);
+      if (result.output !== undefined)
+        result.output = bound(result.output, 32768 - dataBytes, "output");
+    }
   }
   if (input.reviewer !== undefined) result.reviewer = bound(input.reviewer, 500, "reviewer");
   if (input.version !== undefined) result.version = bound(input.version, 200, "version");
