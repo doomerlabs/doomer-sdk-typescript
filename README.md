@@ -1236,3 +1236,57 @@ findings. The final coverage guard cannot be overwritten by a later clean opinio
 This API is opt-in. Consumers must replace whole-response validators that throw
 because of one candidate; upgrading the dependency alone does not adopt recovery.
 Composed reviews must propagate incomplete coverage from their children.
+
+### Reporting review evidence sources
+
+Use `ctx.review.source(...)` to register the output of a scanner or an artifact
+reader, including successful runs with no findings. Sources appear on the review
+Sources page independently of findings. Re-reporting the same ID updates that
+invocation; use different IDs for distinct invocations or environments.
+
+```ts
+app.rule("workflow-lint", async (ctx) => {
+  ctx.review.source({
+    id: "actionlint:workflows",
+    kind: "tool",
+    title: "Actionlint",
+    status: "passed",
+    summary: "Checked two workflows; no diagnostics.",
+    version: "1.7.7",
+    scope: [".github/workflows/build.yml", ".github/workflows/release.yml"],
+    output: "No diagnostics.",
+  });
+});
+```
+
+For findings, add `sourceIds: ["actionlint:workflows"]` to `ctx.finding(...)` or
+`ctx.observe(...)`. IDs must reference sources reported by the same run. They
+are namespaced by the runner when combining adversaries. Optional `data` holds
+structured JSON results; `headSha` and an HTTP(S) `url` capture artifact provenance.
+
+Statuses are `passed` (completed without issues), `findings` (completed with
+issues), `error`, `partial`, and `unavailable`. Never label an unexecuted scanner
+as passed. Missing evidence should still be reported using the appropriate
+status; the platform records incomplete source coverage separately from findings.
+
+The SDK accepts at most 32 sources per run. Source text and structured output
+share a 32 KiB UTF-8 budget; oversized structured data is omitted rather than
+serialized as broken JSON. `truncated` is set whenever output or metadata is
+shortened. Source titles, summaries and scope also have bounded lengths. The
+combined protocol supports up to 256 sources. `createAdversaryRunEnvelope` also
+normalizes sources in manually constructed results, and `validateRunEnvelope`
+enforces the combined output/data byte budget in addition to JSON Schema's
+character limits. Both helpers also reject dangling or malformed source IDs
+in active and suppressed findings; the constructor deduplicates valid references.
+
+Invalid source metadata throws `ReviewSourceValidationError` (exported by the
+SDK) with code `invalid_review_source`, a field label such as
+`ctx.review.source.url`, and the source ID when it is valid. Parser failures do
+not include raw URLs or credential values in error messages.
+
+**Remove secrets before reporting any output or URL.** The SDK additionally
+redacts common credential keys, assignments and bearer tokens, but this cannot
+identify every domain-specific secret. Output is evidence, never instructions
+or executable HTML. The `sources` and `sourceIds` fields are optional, preserving
+legacy reviews. Deploy a runner supporting these fields before releasing an
+adversary that emits them; older strict protocol decoders reject unknown fields.
