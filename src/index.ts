@@ -1,3 +1,5 @@
+import { normalizeReviewSource, type ReviewSource } from "./review-sources.js";
+export { type ReviewSource } from "./review-sources.js";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
@@ -263,6 +265,7 @@ export type ConfidenceAggregation = "maximum" | "minimum" | "average";
 export type SeverityAggregation = "highest" | "lowest";
 
 export interface ObservationInit {
+  sourceIds?: string[];
   ruleId: string;
   subject: string;
   groupKey?: string;
@@ -287,6 +290,7 @@ export interface ObservationInit {
 }
 
 export interface FindingInput {
+  sourceIds?: string[];
   id?: string;
   ruleId?: string;
   groupKey?: string;
@@ -306,6 +310,7 @@ export interface FindingInput {
 }
 
 export interface ReviewFinding {
+  sourceIds?: string[];
   id: string;
   ruleId?: string;
   groupKey?: string;
@@ -398,6 +403,7 @@ export interface ReviewPolicy {
 }
 
 export interface ReviewResult {
+  sources?: ReviewSource[];
   adversary: {
     name: string;
     version?: string;
@@ -554,6 +560,8 @@ export interface RuleContext {
   observe: (observation: ObservationInit) => void;
   finding: (finding: FindingInput) => void;
   review: {
+    /** Register evidence even when it produced no findings. Same ID replaces a previous report. */
+    source: (source: ReviewSource) => void;
     /** Sticky coverage guard; later approvals cannot overwrite it. */
     incomplete: (reason: ReviewIncompleteReason) => void;
     assessment: (assessment: ReviewAssessment) => void;
@@ -854,6 +862,7 @@ function toWireReviewResult(result: ReviewResult): WireReviewResult {
       result.assessment === undefined ? undefined : omitUndefined({ ...result.assessment }),
     positives: result.positives.map(toWireReviewNote),
     observations: result.observations.map(toWireReviewNote),
+    sources: result.sources,
     findings: result.findings.map(toWireFinding),
     opinion: result.opinion === undefined ? undefined : omitUndefined({ ...result.opinion }),
     suppressed: result.suppressed,
@@ -875,6 +884,7 @@ function toWireReviewNote(note: ReviewNote): WireReviewNote {
 function toWireFinding(finding: ReviewFinding): WireReviewFinding {
   return omitUndefined({
     id: finding.id,
+    sourceIds: finding.sourceIds,
     ruleId: finding.ruleId,
     groupKey: finding.groupKey,
     title: finding.title,
@@ -1351,6 +1361,12 @@ function createRuleContext(
       });
     },
     review: {
+      source(source: ReviewSource): void {
+        const normalized = normalizeReviewSource(source);
+        if (!collector.sources.has(normalized.id) && collector.sources.size >= 32)
+          throw new Error("At most 32 review sources are allowed.");
+        collector.sources.set(normalized.id, normalized);
+      },
       incomplete(reason: ReviewIncompleteReason): void {
         if (!["candidate_validation", "assessment_validation"].includes(reason))
           throw new TypeError("Invalid incomplete review reason.");
@@ -1455,6 +1471,7 @@ function globPatternToRegExp(pattern: string): RegExp {
 }
 
 interface ReviewCollector {
+  sources: Map<string, ReviewSource>;
   incomplete?: boolean;
   incompleteBlocking?: boolean;
   observations: ObservationInit[];
@@ -1473,6 +1490,7 @@ interface CollectedFinding {
 
 function createReviewCollector(): ReviewCollector {
   return {
+    sources: new Map(),
     observations: [],
     findings: [],
     positives: [],
@@ -1503,6 +1521,11 @@ function buildReviewResult(input: {
     ...synthesis.findings.map((finding) => ({ finding, deduplicate: true })),
     ...input.collector.findings,
   ]).map((finding) => calibrateFindingSeverity(finding, input.policy));
+  for (const finding of allFindings) {
+    for (const id of finding.sourceIds ?? []) {
+      if (!input.collector.sources.has(id)) throw new Error(`Unknown review source: ${id}`);
+    }
+  }
   const ranked = rankFindings(allFindings);
   const minimumConfidence = input.policy.minimumConfidence ?? Confidence.Medium;
   const includeInformational = input.policy.includeInformational ?? false;
@@ -1523,6 +1546,18 @@ function buildReviewResult(input: {
     }
   }
 
+  if (
+    [...input.collector.sources.values()].some((source) =>
+      ["error", "partial", "unavailable"].includes(source.status),
+    )
+  ) {
+    input.collector.incomplete = true;
+    input.collector.reviewObservations.push({
+      key: "code-review.coverage-gap.sources",
+      summary: "One or more reported evidence sources are incomplete.",
+      metadata: { incomplete: true },
+    });
+  }
   const positives = selectPositiveSignals(input.collector.positives);
   const reviewObservations = deduplicateReviewObservations(
     [
@@ -1547,6 +1582,7 @@ function buildReviewResult(input: {
     assessment,
     positives,
     observations: reviewObservations,
+    sources: input.collector.sources.size ? [...input.collector.sources.values()] : undefined,
     findings: eligible,
     opinion,
     suppressed: {
@@ -1669,6 +1705,9 @@ function synthesizeObservationFindings(
       remediation: synthesis.remediation ?? first.remediation,
       tags: synthesis.tags ?? uniqueStrings(group.flatMap((observation) => observation.tags ?? [])),
       metadata: synthesis.metadata ?? first.metadata,
+      sourceIds: group.some((item) => item.sourceIds?.length)
+        ? uniqueStrings(group.flatMap((item) => item.sourceIds ?? []))
+        : undefined,
     };
     assertFindingInput(finding, `adversary aggregate rule "${first.ruleId}"`);
     return finding;
@@ -1716,6 +1755,7 @@ function normalizeFindingInput(input: FindingInput, occurrence = 0): ReviewFindi
     remediation: input.remediation,
     tags: input.tags === undefined ? undefined : uniqueStrings(input.tags),
     metadata: input.metadata,
+    sourceIds: input.sourceIds === undefined ? undefined : uniqueStrings(input.sourceIds),
   }) as ReviewFinding;
 }
 
@@ -1734,6 +1774,11 @@ function deduplicateFindings(findings: CollectedFinding[]): ReviewFinding[] {
       const existing = result.find((item) => (item.groupKey ?? item.id) === key);
       if (existing !== undefined) {
         existing.evidence = deduplicateEvidence([...existing.evidence, ...finding.evidence]);
+        if (existing.sourceIds?.length || finding.sourceIds?.length)
+          existing.sourceIds = uniqueStrings([
+            ...(existing.sourceIds ?? []),
+            ...(finding.sourceIds ?? []),
+          ]);
         existing.tags = uniqueStrings([...(existing.tags ?? []), ...(finding.tags ?? [])]);
       }
       continue;
