@@ -1,0 +1,29 @@
+package-lock.json
+  s_b2af389a952e96::t_098c32d10cd03e 3,9
+package.json
+  s_8691e594cfe4ef::t_1519540bcde3a5 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "849e0a18fd6ba75956698b093ec906430fe96c5a",
+  "prompts": {},
+  "sessions": {
+    "s_8691e594cfe4ef": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a14b3a-691c-7d81-a8bb-9ee61559e404",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Marc Campbell <marc.e.campbell@gmail.com>"
+    },
+    "s_b2af389a952e96": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a14620-94cd-7443-8352-8c9a8de878d4",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Marc Campbell <marc.e.campbell@gmail.com>"
+    }
+  }
+}
