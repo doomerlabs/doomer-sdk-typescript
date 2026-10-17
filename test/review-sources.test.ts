@@ -586,3 +586,28 @@ it("redacts credentials followed by inline text across raw output, data and URLs
     expect(result.output).toContain("[REDACTED]");
   }
 });
+
+it("composes Bearer and assignment redaction without exposing the assignment value", () => {
+  for (const text of [
+    "Bearer\npassword=hunter2",
+    "Bearer token=hunter2",
+    "Bearer password= hunter2",
+    "Bearer\tGITHUB_TOKEN=hunter2",
+    "Bearer ghp_abc was revoked",
+    "Bearer abc123== (expired)",
+  ]) {
+    const result = normalizeReviewSource({
+      ...source,
+      output: text,
+      data: { note: text },
+      url: `https://example.com/${encodeURIComponent(text)}?note=${encodeURIComponent(text)}`,
+    });
+    for (const secret of ["hunter2", "ghp_abc", "abc123"]) {
+      expect(result.output).not.toContain(secret);
+      expect(JSON.stringify(result.data)).not.toContain(secret);
+      expect(result.url).not.toContain(secret);
+    }
+    expect(result.output).toContain("[REDACTED]");
+    expect(normalizeReviewSource(result).output).toBe(result.output);
+  }
+});
