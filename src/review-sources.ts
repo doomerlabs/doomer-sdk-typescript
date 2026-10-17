@@ -29,8 +29,8 @@ const secretNames =
 const credentialName = `(?:[a-z0-9]+[_-])*(?:${secretNames})`;
 const secretKey = new RegExp(`^${credentialName}$`, "i");
 const secretAssignment = new RegExp(
-  `((?<![\\w-])["']?${credentialName}["']?\\s*[=:]\\s*)(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Basic|Bearer)\\s+[^\\s,;]+|[^\\s,;]+)`,
-  "gi",
+  `((?<![\\w-])["']?${credentialName}["']?\\s*[=:]\\s*)(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Basic|Bearer)\\s+[^\\s,;]+|[^\\s,;]+)(?=\\s*(?:$|[,;\\r\\n}\\]]))`,
+  "gim",
 );
 
 export class ReviewSourceValidationError extends Error {
@@ -77,7 +77,7 @@ export function parseReviewSourceUrl(value: unknown, field: string, sourceId?: s
 
 function redact(text: string): string {
   return text
-    .replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]+=*/gi, "$1[REDACTED]")
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]+=*(?=$|[\r\n"',;])/gim, "$1[REDACTED]")
     .replace(secretAssignment, '$1"[REDACTED]"');
 }
 
@@ -138,7 +138,7 @@ export function normalizeReviewSource(input: ReviewSource, label = "reviewSource
   let truncated = input.truncated ?? false;
   const bound = (value: string, max: number, field: string) => {
     if (typeof value !== "string") fail(field, "must be a string");
-    const safe = redact(value);
+    const safe = field === "output" ? redact(value) : value;
     const bytes = Buffer.from(safe);
     if (bytes.length <= max) return safe;
     truncated = true;
@@ -187,10 +187,13 @@ export function normalizeReviewSource(input: ReviewSource, label = "reviewSource
   if (input.version !== undefined) result.version = bound(input.version, 200, "version");
   if (input.headSha !== undefined) result.headSha = bound(input.headSha, 100, "headSha");
   if (input.scope !== undefined) {
-    if (!Array.isArray(input.scope) || input.scope.some((item) => typeof item !== "string"))
-      fail("scope", "must be an array of strings");
+    if (!Array.isArray(input.scope)) fail("scope", "must be an array of strings");
+    const invalidIndex = input.scope.findIndex((item) => typeof item !== "string");
+    if (invalidIndex !== -1) fail(`scope[${invalidIndex}]`, "must be a string");
     if (input.scope.length > 100) truncated = true;
-    result.scope = input.scope.slice(0, 100).map((item) => bound(item, 500, "scope"));
+    result.scope = input.scope
+      .slice(0, 100)
+      .map((item, index) => bound(item, 500, `scope[${index}]`));
   }
   if (input.url !== undefined) {
     if (typeof input.url !== "string") fail("url", "must be an HTTP(S) URL without credentials");

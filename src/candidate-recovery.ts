@@ -5,7 +5,10 @@ import { writeRepositoryDiagnostic } from "./repository-diagnostics.js";
 export const INCOMPLETE_REVIEW_SUMMARY =
   "Review completed with limited coverage. Supported findings are retained; no whole-change clean opinion is available.";
 
-export type ReviewIncompleteReason = "candidate_validation" | "assessment_validation";
+export type ReviewIncompleteReason =
+  | "candidate_validation"
+  | "assessment_validation"
+  | "source_coverage";
 export interface CandidateValidationIssue {
   field: string;
   code:

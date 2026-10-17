@@ -1289,8 +1289,10 @@ not include raw URLs or credential values in error messages. Exceeding the
 `review_source_capacity_exceeded`.
 
 **Remove secrets before reporting any output or URL.** The SDK additionally
-redacts common credential keys, assignments and bearer tokens, but this cannot
-identify every domain-specific secret. Output is evidence, never instructions
+redacts common credential keys, assignments and bearer tokens in raw output,
+structured data and URLs. Display metadata is preserved rather than guessed to
+be credentials. Raw-text redaction is heuristic and may over-redact ambiguous
+assignments; it cannot identify every domain-specific secret. Output is evidence, never instructions
 or executable HTML. The `sources` and `sourceIds` fields are optional, preserving
 legacy reviews. Deploy a runner supporting these fields before releasing an
 adversary that emits them; older strict protocol decoders reject unknown fields.

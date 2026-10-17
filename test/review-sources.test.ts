@@ -170,7 +170,7 @@ describe("review source validation regressions", () => {
         expect(error).toBeInstanceOf(ReviewSourceValidationError);
         expect(error).toMatchObject({
           code: "invalid_review_source",
-          field: `ctx.review.source.${field}`,
+          field: `ctx.review.source.${field === "scope" && Array.isArray(value) ? "scope[0]" : field}`,
           sourceId: source.id,
         });
         expect((error as Error).message).not.toContain("secret invalid URL");
@@ -496,4 +496,72 @@ it("indexes source normalization errors and omits invalid IDs from URL diagnosti
     expect(error).toMatchObject({ field: "result.sources[1].url", sourceId: undefined });
     expect((error as Error).message).not.toContain("private-value");
   }
+});
+
+it("preserves benign display text and prose while scrubbing raw credentials", () => {
+  const text = "Bearer token required for API access; token: rotation pending";
+  const result = normalizeReviewSource({
+    ...source,
+    kind: "token: rotation pending",
+    title: text,
+    summary: text,
+    scope: ["secret: rotation pending"],
+    output: `${text}\npassword=hunter2`,
+  });
+  expect(result.title).toBe(text);
+  expect(result.summary).toBe(text);
+  expect(result.kind).toBe("token: rotation pending");
+  expect(result.scope).toEqual(["secret: rotation pending"]);
+  expect(result.output).toContain(text);
+  expect(result.output).not.toContain("hunter2");
+});
+
+it("gives malformed references the same caller, rule and position context", async () => {
+  for (const method of ["finding", "observe"] as const) {
+    const app = new Adversary({ name: "early-context" });
+    app.rule("sources", (ctx) => {
+      for (const sourceIds of [undefined, [123]])
+        ctx[method]({
+          ruleId: "sources",
+          subject: "ci.yml",
+          title: "Finding",
+          summary: "Details",
+          category: "ci",
+          severity: "high",
+          confidence: "high",
+          evidence: [{ file: "ci.yml", line: 1 }],
+          sourceIds,
+        } as never);
+    });
+    await expect(app.run({ input: { source: { path: process.cwd() } } })).rejects.toMatchObject({
+      field: `ctx.${method} (rule sources)[1].sourceIds`,
+    });
+  }
+});
+
+it("omits empty manual sources and reports the failing scope item", async () => {
+  const result = await new Adversary({ name: "empty-sources" }).run({
+    input: { source: { path: process.cwd() } },
+  });
+  expect(createAdversaryRunEnvelope({ ...result, sources: [] }).result).not.toHaveProperty(
+    "sources",
+  );
+  try {
+    normalizeReviewSource(
+      { ...source, scope: ["valid", 42] } as unknown as ReviewSource,
+      "ctx.review.source",
+    );
+    throw new Error("expected scope rejection");
+  } catch (error) {
+    expect(error).toMatchObject({ field: "ctx.review.source.scope[1]", sourceId: source.id });
+  }
+});
+
+it("records a machine-readable context reason for incomplete sources", async () => {
+  const app = new Adversary({ name: "source-reason" });
+  app.rule("sources", (ctx) => ctx.review.source({ ...source, status: "unavailable" }));
+  const result = await app.run({ input: { source: { path: process.cwd() } } });
+  expect(
+    result.observations.find((note) => note.key === "code-review.coverage-gap.sources")?.metadata,
+  ).toMatchObject({ role: "context", incomplete: true, reason: "source_coverage" });
 });

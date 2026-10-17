@@ -880,7 +880,7 @@ function toWireReviewResult(result: ReviewResult): WireReviewResult {
       result.assessment === undefined ? undefined : omitUndefined({ ...result.assessment }),
     positives: result.positives.map(toWireReviewNote),
     observations: result.observations.map(toWireReviewNote),
-    sources,
+    sources: sources?.length ? sources : undefined,
     findings: result.findings.map(toWireFinding),
     opinion: result.opinion === undefined ? undefined : omitUndefined({ ...result.opinion }),
     suppressed: result.suppressed,
@@ -1399,11 +1399,11 @@ function createRuleContext(
       return loadInScopeSourcesImpl(absoluteRepoPath, change, options);
     },
     observe(observation: ObservationInit): void {
-      assertObservationInit(observation, "ctx.observe", registry);
+      assertObservationInit(observation, "ctx.observe", registry, collector.observations.length);
       collector.observations.push(observation);
     },
     finding(finding: FindingInput): void {
-      assertFindingInput(finding, "ctx.finding");
+      assertFindingInput(finding, "ctx.finding", collector.findings.length);
       collector.findings.push({
         finding: normalizeFindingInput(finding, collector.findings.length),
         deduplicate: finding.deduplicate !== false,
@@ -1417,7 +1417,7 @@ function createRuleContext(
         collector.sources.set(normalized.id, normalized);
       },
       incomplete(reason: ReviewIncompleteReason): void {
-        if (!["candidate_validation", "assessment_validation"].includes(reason))
+        if (!["candidate_validation", "assessment_validation", "source_coverage"].includes(reason))
           throw new TypeError("Invalid incomplete review reason.");
         collector.incomplete = true;
         collector.incompleteBlocking ||= collector.opinion?.ship === false;
@@ -1629,17 +1629,23 @@ function buildReviewResult(input: {
   }) as ReviewResult;
 }
 
+function sourceReferenceField(caller: string, ruleId: string | undefined, index?: number): string {
+  return `${caller}${ruleId ? ` (rule ${ruleId})` : ""}${index === undefined ? "" : `[${index}]`}.sourceIds`;
+}
+
 function assertCollectedSourceReferences(collector: ReviewCollector): void {
   for (const [index, observation] of collector.observations.entries())
     assertSourceReferences(
       observation.sourceIds,
       collector.sources,
-      `ctx.observe (rule ${observation.ruleId})[${index}].sourceIds`,
+      sourceReferenceField("ctx.observe", observation.ruleId, index),
     );
-  for (const [index, { finding }] of collector.findings.entries()) {
-    const caller = finding.ruleId ? `ctx.finding (rule ${finding.ruleId})` : "ctx.finding";
-    assertSourceReferences(finding.sourceIds, collector.sources, `${caller}[${index}].sourceIds`);
-  }
+  for (const [index, { finding }] of collector.findings.entries())
+    assertSourceReferences(
+      finding.sourceIds,
+      collector.sources,
+      sourceReferenceField("ctx.finding", finding.ruleId, index),
+    );
 }
 
 function assertSourceReferences(
@@ -1692,7 +1698,11 @@ function recordIncompleteSourceCoverage(collector: ReviewCollector): void {
   collector.reviewObservations.push({
     key: "code-review.coverage-gap.sources",
     summary: "One or more reported evidence sources are incomplete.",
-    metadata: { incomplete: true },
+    metadata: {
+      role: "context",
+      incomplete: true,
+      reason: "source_coverage" satisfies ReviewIncompleteReason,
+    },
   });
 }
 
@@ -3013,6 +3023,7 @@ function assertObservationInit(
   value: ObservationInit,
   source: string,
   registry: RuleRegistry,
+  index: number,
 ): void {
   requireString(value.ruleId, `${source}.ruleId`);
   requireString(value.subject, `${source}.subject`);
@@ -3040,10 +3051,10 @@ function assertObservationInit(
   optionalString(value.groupKey, `${source}.groupKey`);
   optionalStringArray(value.groupBy, `${source}.groupBy`);
   optionalStringArray(value.tags, `${source}.tags`);
-  validateSourceIds(value.sourceIds, `${source}.sourceIds`);
+  validateSourceIds(value.sourceIds, sourceReferenceField(source, value.ruleId, index));
 }
 
-function assertFindingInput(value: FindingInput, source: string): void {
+function assertFindingInput(value: FindingInput, source: string, index?: number): void {
   requireString(value.title, `${source}.title`);
   requireString(value.category, `${source}.category`);
   requireString(value.summary, `${source}.summary`);
@@ -3061,7 +3072,7 @@ function assertFindingInput(value: FindingInput, source: string): void {
   optionalString(value.ruleId, `${source}.ruleId`);
   optionalString(value.groupKey, `${source}.groupKey`);
   optionalStringArray(value.tags, `${source}.tags`);
-  validateSourceIds(value.sourceIds, `${source}.sourceIds`);
+  validateSourceIds(value.sourceIds, sourceReferenceField(source, value.ruleId, index));
   optionalRemediation(value.remediation, `${source}.remediation`);
 }
 
