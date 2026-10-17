@@ -23,6 +23,7 @@ import {
   ReviewSourceValidationError,
   normalizeReviewSource,
   validateReviewSourceBudget,
+  validateSourceIds,
 } from "./review-sources.js";
 import {
   type InScopeSource,
@@ -865,6 +866,8 @@ export function createAdversaryRunEnvelope(result: ReviewResult): AdversaryRunEn
 }
 
 function toWireReviewResult(result: ReviewResult): WireReviewResult {
+  const sources = result.sources?.map((source) => normalizeReviewSource(source, "result.sources"));
+  assertResultSourceReferences(result, sources ?? []);
   return omitUndefined({
     adversary: omitUndefined(result.adversary),
     target: omitUndefined(result.target),
@@ -872,7 +875,7 @@ function toWireReviewResult(result: ReviewResult): WireReviewResult {
       result.assessment === undefined ? undefined : omitUndefined({ ...result.assessment }),
     positives: result.positives.map(toWireReviewNote),
     observations: result.observations.map(toWireReviewNote),
-    sources: result.sources?.map((source) => normalizeReviewSource(source, "result.sources")),
+    sources,
     findings: result.findings.map(toWireFinding),
     opinion: result.opinion === undefined ? undefined : omitUndefined({ ...result.opinion }),
     suppressed: result.suppressed,
@@ -894,7 +897,7 @@ function toWireReviewNote(note: ReviewNote): WireReviewNote {
 function toWireFinding(finding: ReviewFinding): WireReviewFinding {
   return omitUndefined({
     id: finding.id,
-    sourceIds: finding.sourceIds,
+    sourceIds: finding.sourceIds === undefined ? undefined : uniqueStrings(finding.sourceIds),
     ruleId: finding.ruleId,
     groupKey: finding.groupKey,
     title: finding.title,
@@ -1016,6 +1019,16 @@ export async function writeOutput(
 }
 
 export async function validateRunEnvelope(output: unknown): Promise<void> {
+  if (isRecord(output) && isRecord(output.result)) {
+    for (const field of ["findings", "suppressedFindings"] as const) {
+      const findings = output.result[field];
+      if (!Array.isArray(findings)) continue;
+      for (const [index, finding] of findings.entries()) {
+        if (isRecord(finding))
+          validateSourceIds(finding.sourceIds, `result.${field}[${index}].sourceIds`);
+      }
+    }
+  }
   let validator = envelopeValidator;
   if (validator === undefined) {
     const schema = JSON.parse(
@@ -1030,7 +1043,9 @@ export async function validateRunEnvelope(output: unknown): Promise<void> {
   if (!validator(output)) {
     throw new Error(`Invalid adversary.review.v1 envelope: ${JSON.stringify(validator.errors)}`);
   }
-  for (const source of (output as AdversaryRunEnvelope).result.sources ?? []) {
+  const result = (output as AdversaryRunEnvelope).result;
+  assertResultSourceReferences(result, result.sources ?? []);
+  for (const source of result.sources ?? []) {
     validateReviewSourceBudget(source, "result.sources");
   }
 }
@@ -1378,7 +1393,7 @@ function createRuleContext(
         const normalized = normalizeReviewSource(source, "ctx.review.source");
         if (!collector.sources.has(normalized.id) && collector.sources.size >= 32)
           throw new ReviewSourceValidationError(
-            "ctx.review.source.id",
+            "ctx.review.source",
             "at most 32 sources are allowed",
             normalized.id,
           );
@@ -1598,14 +1613,26 @@ function buildReviewResult(input: {
 }
 
 function assertFindingSourceReferences(
-  findings: ReviewFinding[],
+  findings: Pick<ReviewFinding, "sourceIds">[],
   sources: Map<string, ReviewSource>,
+  label = "finding",
 ): void {
-  const unknown = findings
-    .flatMap((finding) => finding.sourceIds ?? [])
-    .find((id) => !sources.has(id));
-  if (unknown !== undefined)
-    throw new ReviewSourceValidationError("finding.sourceIds", "Unknown review source");
+  for (const [index, finding] of findings.entries()) {
+    const field = `${label}[${index}].sourceIds`;
+    validateSourceIds(finding.sourceIds, field);
+    const unknown = finding.sourceIds?.find((id) => !sources.has(id));
+    if (unknown !== undefined)
+      throw new ReviewSourceValidationError(field, "Unknown review source", unknown);
+  }
+}
+
+function assertResultSourceReferences(
+  result: Pick<ReviewResult, "findings" | "suppressedFindings">,
+  sources: ReviewSource[],
+): void {
+  const byId = new Map(sources.map((source) => [source.id, source]));
+  assertFindingSourceReferences(result.findings, byId, "result.findings");
+  assertFindingSourceReferences(result.suppressedFindings ?? [], byId, "result.suppressedFindings");
 }
 
 function recordIncompleteSourceCoverage(collector: ReviewCollector): void {
@@ -2963,7 +2990,7 @@ function assertObservationInit(
   optionalString(value.groupKey, `${source}.groupKey`);
   optionalStringArray(value.groupBy, `${source}.groupBy`);
   optionalStringArray(value.tags, `${source}.tags`);
-  optionalStringArray(value.sourceIds, `${source}.sourceIds`);
+  validateSourceIds(value.sourceIds, `${source}.sourceIds`);
 }
 
 function assertFindingInput(value: FindingInput, source: string): void {
@@ -2984,7 +3011,7 @@ function assertFindingInput(value: FindingInput, source: string): void {
   optionalString(value.ruleId, `${source}.ruleId`);
   optionalString(value.groupKey, `${source}.groupKey`);
   optionalStringArray(value.tags, `${source}.tags`);
-  optionalStringArray(value.sourceIds, `${source}.sourceIds`);
+  validateSourceIds(value.sourceIds, `${source}.sourceIds`);
   optionalRemediation(value.remediation, `${source}.remediation`);
 }
 

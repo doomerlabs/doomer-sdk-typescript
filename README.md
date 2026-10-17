@@ -1276,7 +1276,8 @@ shortened. Source titles, summaries and scope also have bounded lengths. The
 combined protocol supports up to 256 sources. `createAdversaryRunEnvelope` also
 normalizes sources in manually constructed results, and `validateRunEnvelope`
 enforces the combined output/data byte budget in addition to JSON Schema's
-character limits.
+character limits. Both helpers also reject dangling or malformed source IDs
+in active and suppressed findings; the constructor deduplicates valid references.
 
 Invalid source metadata throws `ReviewSourceValidationError` (exported by the
 SDK) with code `invalid_review_source`, a field label such as

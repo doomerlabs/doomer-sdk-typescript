@@ -215,3 +215,135 @@ describe("review source validation regressions", () => {
     await expect(validateRunEnvelope(envelope)).rejects.toBeInstanceOf(ReviewSourceValidationError);
   });
 });
+
+describe("source contract boundary regressions", () => {
+  it("redacts separator-prefixed credential names without matching unrelated words", () => {
+    for (const key of [
+      "GITHUB_TOKEN",
+      "client_secret",
+      "AWS_SECRET_ACCESS_KEY",
+      "service-private-key",
+    ]) {
+      const normalized = normalizeReviewSource({
+        ...source,
+        output: `${key}=hunter2`,
+        data: { [key]: "hunter2", tokenizer: "visible", secretive: "visible" },
+        url: `https://example.com/?${key}=hunter2&tokenizer=visible`,
+      });
+      expect(normalized.output).not.toContain("hunter2");
+      expect(normalized.data?.[key]).toBe("[REDACTED]");
+      expect(normalized.data?.tokenizer).toBe("visible");
+      expect(normalized.data?.secretive).toBe("visible");
+      expect(normalized.url).not.toContain("hunter2");
+      expect(new URL(normalized.url ?? "").searchParams.get("tokenizer")).toBe("visible");
+    }
+  });
+
+  it("preserves URL separators and accepts literal percent signs while scrubbing paths", () => {
+    const url = "https://example.com/100%/a%2Fb/token%3Dhunter2%3Fextra%23tail?q=safe#100%";
+    const normalized = new URL(normalizeReviewSource({ ...source, url }).url ?? "");
+    expect(normalized.pathname).toContain("/100%/a%2Fb/");
+    expect(normalized.pathname).not.toContain("hunter2");
+    expect(normalized.search).toBe("?q=safe");
+    expect(normalized.hash).toBe("#100%");
+    expect(normalizeReviewSource({ ...source, url: normalized.toString() }).url).toBe(
+      normalized.toString(),
+    );
+  });
+
+  it("wraps wire data serialization failures in typed errors", async () => {
+    const result = await new Adversary({ name: "wire-json" }).run({
+      input: { source: { path: process.cwd() } },
+    });
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    for (const data of [
+      circular,
+      { value: 1n },
+      {
+        toJSON() {
+          throw new Error("private details");
+        },
+      },
+    ]) {
+      const envelope = createAdversaryRunEnvelope(result);
+      envelope.result.sources = [{ ...source, data }];
+      await expect(validateRunEnvelope(envelope)).rejects.toMatchObject({
+        name: "ReviewSourceValidationError",
+        code: "invalid_review_source",
+        field: "result.sources.data",
+        sourceId: source.id,
+      });
+    }
+  });
+
+  it("validates active and suppressed references at construction and wire boundaries", async () => {
+    const app = new Adversary({ name: "manual-references" });
+    app.rule("sources", (ctx) => {
+      ctx.review.source(source);
+      ctx.finding({
+        title: "Finding",
+        summary: "Details",
+        category: "ci",
+        severity: "high",
+        confidence: "high",
+        evidence: [{ file: "ci.yml", line: 1 }],
+        sourceIds: [source.id],
+      });
+    });
+    const result = await app.run({ input: { source: { path: process.cwd() } } });
+    const finding = result.findings[0];
+    for (const field of ["findings", "suppressedFindings"] as const) {
+      for (const invalidId of ["missing", "", "bad id"]) {
+        const manual = { ...result, [field]: [{ ...finding, sourceIds: [invalidId] }] };
+        expect(() => createAdversaryRunEnvelope(manual)).toThrow(ReviewSourceValidationError);
+        const envelope = createAdversaryRunEnvelope(result);
+        envelope.result[field] = [{ ...envelope.result.findings[0], sourceIds: [invalidId] }];
+        await expect(validateRunEnvelope(envelope)).rejects.toBeInstanceOf(
+          ReviewSourceValidationError,
+        );
+      }
+    }
+    const envelope = createAdversaryRunEnvelope({
+      ...result,
+      findings: [{ ...finding, sourceIds: [source.id, source.id] }],
+    });
+    expect(envelope.result.findings[0].sourceIds).toEqual([source.id]);
+    await expect(validateRunEnvelope(envelope)).resolves.toBeUndefined();
+  });
+
+  it("rejects blank or malformed context source IDs instead of dropping them", async () => {
+    for (const method of ["finding", "observe"] as const) {
+      for (const id of ["", "bad id"]) {
+        const app = new Adversary({ name: "invalid-id" });
+        app.rule("sources", (ctx) =>
+          ctx[method]({
+            ruleId: "sources",
+            subject: "ci.yml",
+            title: "Finding",
+            summary: "Details",
+            category: "ci",
+            severity: "high",
+            confidence: "high",
+            evidence: [{ file: "ci.yml", line: 1 }],
+            sourceIds: [id],
+          } as never),
+        );
+        await expect(
+          app.run({ input: { source: { path: process.cwd() } } }),
+        ).rejects.toBeInstanceOf(ReviewSourceValidationError);
+      }
+    }
+  });
+
+  it("labels capacity exhaustion as a source operation rather than an invalid ID", async () => {
+    const app = new Adversary({ name: "source-capacity" });
+    app.rule("sources", (ctx) => {
+      for (let i = 0; i < 33; i++) ctx.review.source({ ...source, id: `source-${i}` });
+    });
+    await expect(app.run({ input: { source: { path: process.cwd() } } })).rejects.toMatchObject({
+      field: "ctx.review.source",
+      code: "invalid_review_source",
+    });
+  });
+});

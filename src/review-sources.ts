@@ -25,10 +25,11 @@ export interface ReviewSource {
 
 const sourceIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const secretNames =
-  "password|passwd|secret|token|access[_-]?token|api[_-]?key|authorization|private[_-]?key";
-const secretKey = new RegExp(`^(?:${secretNames})$`, "i");
+  "password|passwd|secret|token|access[_-]?token|access[_-]?key|api[_-]?key|authorization|private[_-]?key";
+const credentialName = `(?:[a-z0-9]+[_-])*(?:${secretNames})`;
+const secretKey = new RegExp(`^${credentialName}$`, "i");
 const secretAssignment = new RegExp(
-  `((?<![\\w-])["']?(?:${secretNames})["']?\\s*[=:]\\s*)(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Basic|Bearer)\\s+[^\\s,;]+|[^\\s,;]+)`,
+  `((?<![\\w-])["']?${credentialName}["']?\\s*[=:]\\s*)(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Basic|Bearer)\\s+[^\\s,;]+|[^\\s,;]+)`,
   "gi",
 );
 
@@ -52,15 +53,44 @@ function redact(text: string): string {
 
 /** JSON Schema limits characters; the wire validator also enforces this shared UTF-8 budget. */
 export function validateReviewSourceBudget(source: ReviewSource, label: string): void {
-  if (
-    Buffer.byteLength(source.output ?? "") + Buffer.byteLength(JSON.stringify(source.data) ?? "") >
-    32768
-  )
+  let data: string;
+  try {
+    data = JSON.stringify(source.data) ?? "";
+  } catch {
+    throw new ReviewSourceValidationError(`${label}.data`, "must be JSON-serializable", source.id);
+  }
+  if (Buffer.byteLength(source.output ?? "") + Buffer.byteLength(data) > 32768)
     throw new ReviewSourceValidationError(
       `${label}.data/output`,
       "combined UTF-8 payload exceeds 32768 bytes",
       source.id,
     );
+}
+
+/** Decode valid runs only; lone percent signs and invalid UTF-8 remain legal URL text. */
+function redactUrlComponent(encoded: string): string {
+  const decoded = encoded.replace(/(?:%[0-9a-f]{2})+/gi, (run) => {
+    try {
+      return decodeURIComponent(run);
+    } catch {
+      return run;
+    }
+  });
+  const safe = redact(decoded);
+  // Re-encode changed components so decoded separators cannot alter URL structure.
+  return safe === decoded ? encoded : encodeURIComponent(safe);
+}
+
+export function validateSourceIds(
+  value: unknown,
+  field: string,
+): asserts value is string[] | undefined {
+  if (value === undefined) return;
+  if (
+    !Array.isArray(value) ||
+    value.some((id) => typeof id !== "string" || !sourceIdPattern.test(id))
+  )
+    throw new ReviewSourceValidationError(field, "must be an array of valid source IDs");
 }
 
 /** Producers must remove domain-specific secrets before reporting. This is defense in depth. */
@@ -137,10 +167,8 @@ export function normalizeReviewSource(input: ReviewSource, label = "reviewSource
         params.append(key, secretKey.test(key) ? "[REDACTED]" : redact(value));
       }
       url.search = params.toString();
-      const path = decodeURIComponent(url.pathname);
-      const hash = decodeURIComponent(url.hash);
-      if (redact(path) !== path) url.pathname = redact(path);
-      if (redact(hash) !== hash) url.hash = redact(hash);
+      url.pathname = url.pathname.split("/").map(redactUrlComponent).join("/");
+      if (url.hash) url.hash = `#${redactUrlComponent(url.hash.slice(1))}`;
       result.url = url.toString();
       if (result.url.length > 2000) fail("url", "must be at most 2000 characters");
     } catch {
