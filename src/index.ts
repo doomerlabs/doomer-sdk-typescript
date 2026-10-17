@@ -1893,7 +1893,8 @@ function deduplicateFindings(findings: CollectedFinding[]): ReviewFinding[] {
       const existing = result.find((item) => (item.groupKey ?? item.id) === key);
       if (existing !== undefined) {
         existing.evidence = deduplicateEvidence([...existing.evidence, ...finding.evidence]);
-        existing.sourceIds = mergeSourceIds(existing.sourceIds, finding.sourceIds);
+        const sourceIds = mergeSourceIds(existing.sourceIds, finding.sourceIds);
+        if (sourceIds !== undefined) existing.sourceIds = sourceIds;
         existing.tags = uniqueStrings([...(existing.tags ?? []), ...(finding.tags ?? [])]);
       }
       continue;

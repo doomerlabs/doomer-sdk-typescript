@@ -613,3 +613,21 @@ it("composes Bearer and assignment redaction without exposing the assignment val
     expect(normalizeReviewSource(result).output).toBe(result.output);
   }
 });
+
+it("does not add sourceIds to deduplicated legacy findings", async () => {
+  const app = new Adversary({ name: "legacy-deduplication" });
+  app.rule("legacy", (ctx) => {
+    for (let i = 0; i < 2; i++)
+      ctx.finding({
+        title: "Finding",
+        summary: "Details",
+        category: "ci",
+        severity: "high",
+        confidence: "high",
+        evidence: [{ file: "ci.yml", line: 1 }],
+      });
+  });
+  const result = await app.run({ input: { source: { path: process.cwd() } } });
+  expect(result.findings).toHaveLength(1);
+  expect(result.findings[0]).not.toHaveProperty("sourceIds");
+});
