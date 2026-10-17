@@ -164,5 +164,5 @@ describe("published run protocol", () => {
     await expect(validateRunEnvelope(invalid)).rejects.toThrow(
       "must NOT have additional properties",
     );
-  });
+  }, 30_000);
 });

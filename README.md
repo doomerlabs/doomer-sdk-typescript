@@ -1273,7 +1273,15 @@ The SDK accepts at most 32 sources per run. Source text and structured output
 share a 32 KiB UTF-8 budget; oversized structured data is omitted rather than
 serialized as broken JSON. `truncated` is set whenever output or metadata is
 shortened. Source titles, summaries and scope also have bounded lengths. The
-combined protocol supports up to 256 sources.
+combined protocol supports up to 256 sources. `createAdversaryRunEnvelope` also
+normalizes sources in manually constructed results, and `validateRunEnvelope`
+enforces the combined output/data byte budget in addition to JSON Schema's
+character limits.
+
+Invalid source metadata throws `ReviewSourceValidationError` (exported by the
+SDK) with code `invalid_review_source`, a field label such as
+`ctx.review.source.url`, and the source ID when it is valid. Parser failures do
+not include raw URLs or credential values in error messages.
 
 **Remove secrets before reporting any output or URL.** The SDK additionally
 redacts common credential keys, assignments and bearer tokens, but this cannot

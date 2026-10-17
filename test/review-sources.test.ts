@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { Adversary, createAdversaryRunEnvelope, validateRunEnvelope } from "../src/index.js";
-import { type ReviewSource, normalizeReviewSource } from "../src/review-sources.js";
+import {
+  type ReviewSource,
+  ReviewSourceValidationError,
+  normalizeReviewSource,
+} from "../src/review-sources.js";
 
 const source: ReviewSource = {
   id: "actionlint",
@@ -39,7 +43,7 @@ describe("review evidence sources", () => {
     expect(result.sources?.[0].status).toBe("findings");
     expect(result.findings[0].sourceIds).toEqual([source.id]);
     const envelope = createAdversaryRunEnvelope(result);
-    expect(() => validateRunEnvelope(envelope)).not.toThrow();
+    await expect(validateRunEnvelope(envelope)).resolves.toBeUndefined();
     expect(envelope.result.findings[0].sourceIds).toEqual([source.id]);
   });
 
@@ -103,5 +107,111 @@ describe("review evidence sources", () => {
       input: { source: { path: process.cwd() } },
     });
     expect(createAdversaryRunEnvelope(result).result).not.toHaveProperty("sources");
+  });
+});
+
+describe("review source validation regressions", () => {
+  it("redacts every supported credential assignment, including quoted JSON", () => {
+    for (const key of [
+      "password",
+      "passwd",
+      "secret",
+      "token",
+      "access_token",
+      "api-key",
+      "authorization",
+      "private_key",
+    ]) {
+      for (const output of [
+        `${key}=hunter2`,
+        `"${key}": "hunter2"`,
+        `'${key}': 'hunter2'`,
+        `${key}: Basic hunter2`,
+      ]) {
+        expect(normalizeReviewSource({ ...source, output }).output).not.toContain("hunter2");
+      }
+    }
+    const output = normalizeReviewSource({
+      ...source,
+      output: '{"password":"hunter2","count":3}',
+    }).output;
+    expect(JSON.parse(output ?? "")).toEqual({ password: "[REDACTED]", count: 3 });
+  });
+
+  it("canonicalizes URLs and redacts decoded query, path and fragment credentials", () => {
+    const result = normalizeReviewSource({
+      ...source,
+      url: "HTTPS://example.com/token=pathsecret?%74oken=querysecret&note=Bearer%20bearersecret#password=hashsecret",
+    });
+    expect(result.url).toMatch(/^https:\/\//);
+    for (const secret of ["pathsecret", "querysecret", "bearersecret", "hashsecret"])
+      expect(result.url).not.toContain(secret);
+    expect(new URL(result.url ?? "").searchParams.get("token")).toBe("[REDACTED]");
+  });
+
+  it("reports typed errors with safe field and caller context", () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    for (const [field, value] of [
+      ["url", "secret invalid URL"],
+      ["data", circular],
+      ["data", { value: 1n }],
+      ["scope", "not-an-array"],
+      ["scope", [1]],
+      ["summary", 4],
+    ] as const) {
+      try {
+        normalizeReviewSource({ ...source, [field]: value } as ReviewSource, "ctx.review.source");
+        throw new Error("expected validation failure");
+      } catch (error) {
+        expect(error).toBeInstanceOf(ReviewSourceValidationError);
+        expect(error).toMatchObject({
+          code: "invalid_review_source",
+          field: `ctx.review.source.${field}`,
+          sourceId: source.id,
+        });
+        expect((error as Error).message).not.toContain("secret invalid URL");
+      }
+    }
+  });
+
+  it("rejects malformed finding and observation source references", async () => {
+    for (const method of ["finding", "observe"] as const) {
+      const app = new Adversary({ name: "invalid-references" });
+      app.rule("sources", (ctx) => {
+        ctx[method]({
+          ruleId: "sources",
+          subject: "ci.yml",
+          title: "Invalid",
+          summary: "Invalid",
+          category: "ci",
+          severity: "high",
+          confidence: "high",
+          evidence: [{ file: "ci.yml", line: 1 }],
+          sourceIds: [123],
+        } as never);
+      });
+      await expect(app.run({ input: { source: { path: process.cwd() } } })).rejects.toThrow(
+        "sourceIds",
+      );
+    }
+  });
+
+  it("normalizes manually constructed results and validates combined wire bytes", async () => {
+    const result = await new Adversary({ name: "wire-budget" }).run({
+      input: { source: { path: process.cwd() } },
+    });
+    result.sources = [{ ...source, output: "λ".repeat(32768), data: { token: "hunter2" } }];
+    const envelope = createAdversaryRunEnvelope(result);
+    expect(envelope.result.sources?.[0].truncated).toBe(true);
+    await expect(validateRunEnvelope(envelope)).resolves.toBeUndefined();
+    envelope.result.sources = [{ ...source, output: "λ".repeat(20000) }];
+    await expect(validateRunEnvelope(envelope)).rejects.toBeInstanceOf(ReviewSourceValidationError);
+    envelope.result.sources = [
+      { ...source, output: "x".repeat(20000), data: { value: "x".repeat(20000) } },
+    ];
+    await expect(validateRunEnvelope(envelope)).rejects.toBeInstanceOf(ReviewSourceValidationError);
+    envelope.result.sources = [{ ...source, data: { value: "x".repeat(40000) } }];
+    await expect(validateRunEnvelope(envelope)).rejects.toBeInstanceOf(ReviewSourceValidationError);
   });
 });

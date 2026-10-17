@@ -11,6 +11,7 @@
   },
   "$defs": {
     "reviewSource": {
+      "description": "The SDK additionally enforces a combined 32768-byte UTF-8 budget for output and JSON-serialized data; JSON Schema maxLength limits characters only.",
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "kind", "title", "status", "summary"],

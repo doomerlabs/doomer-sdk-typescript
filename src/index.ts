@@ -1,5 +1,3 @@
-import { type ReviewSource, normalizeReviewSource } from "./review-sources.js";
-export type { ReviewSource } from "./review-sources.js";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
@@ -21,12 +19,24 @@ import { type RepoGraph, repoGraphFromEnvironment } from "./repo-graph.js";
 import { type RepoIndex, repoIndexFromEnvironment } from "./repo-index.js";
 import { reviewWithRepositoryTools } from "./repository-model.js";
 import {
+  type ReviewSource,
+  ReviewSourceValidationError,
+  normalizeReviewSource,
+  validateReviewSourceBudget,
+} from "./review-sources.js";
+import {
   type InScopeSource,
   type ListInScopePathsOptions,
   type LoadInScopeSourcesOptions,
   listInScopePaths as listInScopePathsImpl,
   loadInScopeSources as loadInScopeSourcesImpl,
 } from "./sources.js";
+
+export {
+  REVIEW_SOURCE_STATUSES,
+  ReviewSourceValidationError,
+  type ReviewSource,
+} from "./review-sources.js";
 
 export {
   ADVERSARY_MODEL_ENDPOINT_ENV,
@@ -862,7 +872,7 @@ function toWireReviewResult(result: ReviewResult): WireReviewResult {
       result.assessment === undefined ? undefined : omitUndefined({ ...result.assessment }),
     positives: result.positives.map(toWireReviewNote),
     observations: result.observations.map(toWireReviewNote),
-    sources: result.sources,
+    sources: result.sources?.map((source) => normalizeReviewSource(source, "result.sources")),
     findings: result.findings.map(toWireFinding),
     opinion: result.opinion === undefined ? undefined : omitUndefined({ ...result.opinion }),
     suppressed: result.suppressed,
@@ -1019,6 +1029,9 @@ export async function validateRunEnvelope(output: unknown): Promise<void> {
   }
   if (!validator(output)) {
     throw new Error(`Invalid adversary.review.v1 envelope: ${JSON.stringify(validator.errors)}`);
+  }
+  for (const source of (output as AdversaryRunEnvelope).result.sources ?? []) {
+    validateReviewSourceBudget(source, "result.sources");
   }
 }
 
@@ -1362,9 +1375,13 @@ function createRuleContext(
     },
     review: {
       source(source: ReviewSource): void {
-        const normalized = normalizeReviewSource(source);
+        const normalized = normalizeReviewSource(source, "ctx.review.source");
         if (!collector.sources.has(normalized.id) && collector.sources.size >= 32)
-          throw new Error("At most 32 review sources are allowed.");
+          throw new ReviewSourceValidationError(
+            "ctx.review.source.id",
+            "at most 32 sources are allowed",
+            normalized.id,
+          );
         collector.sources.set(normalized.id, normalized);
       },
       incomplete(reason: ReviewIncompleteReason): void {
@@ -1521,11 +1538,7 @@ function buildReviewResult(input: {
     ...synthesis.findings.map((finding) => ({ finding, deduplicate: true })),
     ...input.collector.findings,
   ]).map((finding) => calibrateFindingSeverity(finding, input.policy));
-  for (const finding of allFindings) {
-    for (const id of finding.sourceIds ?? []) {
-      if (!input.collector.sources.has(id)) throw new Error(`Unknown review source: ${id}`);
-    }
-  }
+  assertFindingSourceReferences(allFindings, input.collector.sources);
   const ranked = rankFindings(allFindings);
   const minimumConfidence = input.policy.minimumConfidence ?? Confidence.Medium;
   const includeInformational = input.policy.includeInformational ?? false;
@@ -1546,18 +1559,7 @@ function buildReviewResult(input: {
     }
   }
 
-  if (
-    [...input.collector.sources.values()].some((source) =>
-      ["error", "partial", "unavailable"].includes(source.status),
-    )
-  ) {
-    input.collector.incomplete = true;
-    input.collector.reviewObservations.push({
-      key: "code-review.coverage-gap.sources",
-      summary: "One or more reported evidence sources are incomplete.",
-      metadata: { incomplete: true },
-    });
-  }
+  recordIncompleteSourceCoverage(input.collector);
   const positives = selectPositiveSignals(input.collector.positives);
   const reviewObservations = deduplicateReviewObservations(
     [
@@ -1593,6 +1595,32 @@ function buildReviewResult(input: {
     suppressedFindings: input.includeSuppressed ? suppressedFindings : undefined,
     rawObservations: input.includeRawObservations ? input.collector.observations : undefined,
   }) as ReviewResult;
+}
+
+function assertFindingSourceReferences(
+  findings: ReviewFinding[],
+  sources: Map<string, ReviewSource>,
+): void {
+  const unknown = findings
+    .flatMap((finding) => finding.sourceIds ?? [])
+    .find((id) => !sources.has(id));
+  if (unknown !== undefined)
+    throw new ReviewSourceValidationError("finding.sourceIds", "Unknown review source");
+}
+
+function recordIncompleteSourceCoverage(collector: ReviewCollector): void {
+  if (
+    ![...collector.sources.values()].some((source) =>
+      ["error", "partial", "unavailable"].includes(source.status),
+    )
+  )
+    return;
+  collector.incomplete = true;
+  collector.reviewObservations.push({
+    key: "code-review.coverage-gap.sources",
+    summary: "One or more reported evidence sources are incomplete.",
+    metadata: { incomplete: true },
+  });
 }
 
 function resolveReviewConclusion(
@@ -2935,6 +2963,7 @@ function assertObservationInit(
   optionalString(value.groupKey, `${source}.groupKey`);
   optionalStringArray(value.groupBy, `${source}.groupBy`);
   optionalStringArray(value.tags, `${source}.tags`);
+  optionalStringArray(value.sourceIds, `${source}.sourceIds`);
 }
 
 function assertFindingInput(value: FindingInput, source: string): void {
@@ -2955,6 +2984,7 @@ function assertFindingInput(value: FindingInput, source: string): void {
   optionalString(value.ruleId, `${source}.ruleId`);
   optionalString(value.groupKey, `${source}.groupKey`);
   optionalStringArray(value.tags, `${source}.tags`);
+  optionalStringArray(value.sourceIds, `${source}.sourceIds`);
   optionalRemediation(value.remediation, `${source}.remediation`);
 }
 
