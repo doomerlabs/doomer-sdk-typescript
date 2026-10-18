@@ -1,5 +1,7 @@
 # adversary-sdk-typescript
 
+[![doomerlabs/doomer-sdk-typescript cover art by coverart.dev](https://coverart.dev/covers/doomerlabs/doomer-sdk-typescript.png)](https://coverart.dev/doomerlabs/doomer-sdk-typescript)
+
 Small TypeScript SDK for building file-based Adversaries.
 
 The SDK owns the runtime boilerplate: read runtime input, discover the source repository path,
