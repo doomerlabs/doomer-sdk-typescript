@@ -1,6 +1,6 @@
 {
   "name": "@adversarylabs/sdk",
-  "version": "0.1.44",
+  "version": "0.1.45",
   "description": "Small TypeScript SDK for authoring Adversaries.",
   "type": "module",
   "license": "Apache-2.0",
@@ -27,7 +27,12 @@
     "./schemas/adversary.review.v1": "./schemas/adversary.review.v1.schema.json",
     "./schemas/adversary.outcome-context.v1": "./schemas/adversary.outcome-context.v1.schema.json"
   },
-  "files": ["dist", "schemas", "templates", "README.md"],
+  "files": [
+    "dist",
+    "schemas",
+    "templates",
+    "README.md"
+  ],
   "engines": {
     "node": ">=22"
   },
