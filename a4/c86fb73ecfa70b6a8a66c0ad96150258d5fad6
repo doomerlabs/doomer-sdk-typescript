@@ -1,0 +1,31 @@
+test/attention-isolation.test.ts
+  s_8e2af51b4f8674::t_defb006d3bf48e 1-53
+  s_8e2af51b4f8674::t_cfd98f5d0a02b0 54-83
+src/model.ts
+  s_8e2af51b4f8674::t_fd7f0e5698d4bf 68-69,96-122,125-126,130,253-255,267,302-337,355,359
+  s_8e2af51b4f8674::t_af8e69600cf41c 338-354,356-358,360-380
+README.md
+  s_8e2af51b4f8674::t_09d1ef8edc33a4 1301-1314
+src/index.ts
+  s_8e2af51b4f8674::t_9207ef9ab968cf 45-47,2267-2274,2366-2375,2408
+src/repository-model.ts
+  s_8e2af51b4f8674::t_78e2782d628ba1 8,14-15,480-483,485-509,511-512,514,615-626,628,890-1101
+test/attention.test.ts
+  s_8e2af51b4f8674::t_eaddefe637b1c2 1-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a4c86fb73ecfa70b6a8a66c0ad96150258d5fad6",
+  "prompts": {},
+  "sessions": {
+    "s_8e2af51b4f8674": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16917-73f8-7e00-a989-fa0821f43afe",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Marc Campbell <marc.e.campbell@gmail.com>"
+    }
+  }
+}
