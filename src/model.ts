@@ -305,76 +305,40 @@ export class BrokerReviewModel implements ReviewModel {
   async #classify(request: ChoiceRequest): Promise<ChoiceAnswers> {
     const timeoutMs = request.timeoutMs ?? 45_000;
     requireIntegerRange(timeoutMs, "choice timeoutMs", 1, 45_000);
+    const body = encodeChoiceRequest(request);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const endpoint = new URL(this.endpoint);
       endpoint.pathname = "/v1/choices";
-      const body = JSON.stringify({ state: request.state, questions: request.questions });
-      if (Buffer.byteLength(body) > 1 << 20 || Object.keys(request.questions).length === 0)
-        throw new ModelReviewError("Invalid choice request size.", {
-          code: "invalid_choice_request",
+      let response: Response;
+      let raw: string;
+      try {
+        response = await fetch(endpoint, {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${this.#token}`,
+            "x-adversary-model-protocol": String(ADVERSARY_MODEL_PROTOCOL_VERSION),
+          },
+          body,
         });
-      const response = await fetch(endpoint, {
-        method: "POST",
-        signal: controller.signal,
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${this.#token}`,
-          "x-adversary-model-protocol": String(ADVERSARY_MODEL_PROTOCOL_VERSION),
-        },
-        body,
-      });
-      const raw = await readBoundedResponse(response);
-      let payload: { answers?: ChoiceAnswers; error?: { code?: string } };
+        raw = await readBoundedResponse(response);
+      } catch (error) {
+        throw brokerTransportError(error, controller.signal, timeoutMs);
+      }
+      let payload: unknown;
       try {
         payload = JSON.parse(raw);
       } catch {
+        if (!response.ok) throw choiceResponseFailure(response.status);
         throw new ModelReviewError("Invalid classifier response.", {
           code: "invalid_choice_response",
         });
       }
-      if (!response.ok)
-        throw new ModelReviewError("Attention classifier unavailable.", {
-          code:
-            payload.error?.code === "classifier_policy_blocked"
-              ? "classifier_policy_blocked"
-              : "attention_classification_failed",
-        });
-      const answers = payload.answers;
-      if (!answers || Object.keys(answers).length !== Object.keys(request.questions).length)
-        throw new ModelReviewError("Incomplete classifier response.", {
-          code: "invalid_choice_response",
-        });
-      for (const [id, question] of Object.entries(request.questions)) {
-        const answer = answers[id];
-        const choices = Object.keys(question.criteria);
-        if (
-          !answer ||
-          answer.type !== "choice" ||
-          !choices.includes(answer.choice) ||
-          !Number.isFinite(answer.confidence) ||
-          answer.confidence < 0 ||
-          answer.confidence > 1 ||
-          !answer.probabilities ||
-          Object.keys(answer.probabilities).length !== choices.length ||
-          choices.some((key) => {
-            const probability = answer.probabilities[key];
-            return (
-              typeof probability !== "number" ||
-              !Number.isFinite(probability) ||
-              probability < 0 ||
-              probability > 1
-            );
-          }) ||
-          Math.abs(choices.reduce((sum, key) => sum + (answer.probabilities[key] ?? 0), 0) - 1) >
-            0.01
-        )
-          throw new ModelReviewError("Invalid classifier choices.", {
-            code: "invalid_choice_response",
-          });
-      }
-      return answers;
+      if (!response.ok) throw choiceResponseFailure(response.status, payload);
+      return requireChoiceAnswers(payload, request.questions);
     } finally {
       clearTimeout(timer);
     }
@@ -894,6 +858,81 @@ function requireIntegerRange(value: number, name: string, minimum: number, maxim
   }
 }
 
+function encodeChoiceRequest(request: ChoiceRequest): string {
+  let body: string;
+  try {
+    body = JSON.stringify({ state: request.state, questions: request.questions });
+  } catch {
+    throw new ModelReviewError("Invalid choice request.", { code: "invalid_choice_request" });
+  }
+  const withinWireBudget = Buffer.byteLength(body) <= 1 << 20;
+  const hasQuestions = Object.keys(request.questions).length > 0;
+  if (!withinWireBudget || !hasQuestions)
+    throw new ModelReviewError("Invalid choice request size.", { code: "invalid_choice_request" });
+  return body;
+}
+
+function choiceRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function choiceResponseFailure(status: number, payload?: unknown): ModelReviewError {
+  const failure = choiceRecord(choiceRecord(payload)?.error);
+  return new ModelReviewError(`Attention classifier returned HTTP ${status}.`, {
+    code:
+      typeof failure?.code === "string" && failure.code !== ""
+        ? failure.code
+        : "attention_classification_failed",
+    retryable: typeof failure?.retryable === "boolean" ? failure.retryable : status >= 500,
+  });
+}
+
+function isChoiceProbability(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function isChoiceDistribution(value: unknown, choices: string[]): boolean {
+  const probabilities = choiceRecord(value);
+  if (!probabilities || Object.keys(probabilities).length !== choices.length) return false;
+  let sum = 0;
+  for (const choice of choices) {
+    const probability = probabilities[choice];
+    if (!isChoiceProbability(probability)) return false;
+    sum += probability;
+  }
+  return Math.abs(sum - 1) <= 0.01;
+}
+
+function isValidChoiceAnswer(value: unknown, question: ChoiceQuestion): value is ChoiceAnswer {
+  const answer = choiceRecord(value);
+  if (!answer || answer.type !== "choice") return false;
+  const choices = Object.keys(question.criteria);
+  const declaredChoice = typeof answer.choice === "string" && choices.includes(answer.choice);
+  const boundedConfidence = isChoiceProbability(answer.confidence);
+  const normalizedDistribution = isChoiceDistribution(answer.probabilities, choices);
+  return declaredChoice && boundedConfidence && normalizedDistribution;
+}
+
+function requireChoiceAnswers(
+  payload: unknown,
+  questions: Record<string, ChoiceQuestion>,
+): ChoiceAnswers {
+  const answers = choiceRecord(choiceRecord(payload)?.answers);
+  if (!answers || Object.keys(answers).length !== Object.keys(questions).length)
+    throw new ModelReviewError("Incomplete classifier response.", {
+      code: "invalid_choice_response",
+    });
+  for (const [id, question] of Object.entries(questions)) {
+    if (!isValidChoiceAnswer(answers[id], question))
+      throw new ModelReviewError("Invalid classifier choices.", {
+        code: "invalid_choice_response",
+      });
+  }
+  return answers as unknown as ChoiceAnswers;
+}
+
 function brokerTransportError(
   error: unknown,
   signal: AbortSignal,
@@ -996,7 +1035,7 @@ function validateUsage(value: unknown): asserts value is ModelReviewUsage {
   }
 }
 
-function validateModelOutput(
+export function validateModelOutput(
   schema: Record<string, unknown>,
   output: unknown,
   usage?: ModelReviewUsage,

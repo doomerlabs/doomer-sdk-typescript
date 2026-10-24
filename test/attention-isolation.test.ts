@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { BrokerReviewModel, createModelFromEnvironment, enhanceReviewModel } from "../src/index.js";
-import type { ModelReviewRequest, ReviewModel } from "../src/model.js";
+import type { ModelReviewRequest, ReviewModel } from "../src/index.js";
 import { reviewWithRepositoryTools } from "../src/repository-model.js";
 
 afterEach(() => vi.restoreAllMocks());

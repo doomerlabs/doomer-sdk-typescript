@@ -4,8 +4,9 @@ import {
   createModelFromEnvironment,
   enhanceReviewModel,
   formatOpinionAsync,
+  rewriteOpinionConcern,
 } from "../src/index.js";
-import type { ChoiceRequest, ReviewModel } from "../src/model.js";
+import type { ChoiceRequest, ReviewModel } from "../src/index.js";
 
 afterEach(() => vi.restoreAllMocks());
 const request: ChoiceRequest = {
@@ -68,17 +69,32 @@ it("rejects unrecognized and incomplete choices", async () => {
   if (!model.classify) throw new Error("classifier unavailable");
   await expect(model.classify(request)).rejects.toMatchObject({ code: "invalid_choice_response" });
 });
-it("preserves the capability through context wrappers and avoids cosmetic generation", async () => {
-  const review = vi.fn();
+it("preserves explicit concern rewriting through attention context wrappers", async () => {
+  const review = vi.fn().mockResolvedValue({
+    output: { concern: "inherited context replacement" },
+    provider: "fixture",
+    model: "rewrite",
+  });
   const model: ReviewModel = { review, classify: async () => ({}) };
   const context = enhanceReviewModel(model);
   expect(context.classify).toBeTypeOf("function");
-  await formatOpinionAsync({
+  const result = await rewriteOpinionConcern(context, {
+    text: "commands replace inherited context with another context",
+  });
+  expect(result).toMatchObject({
+    concern: "inherited context replacement",
+    rewritten: true,
+    provider: "fixture",
+    model: "rewrite",
+  });
+  expect(review).toHaveBeenCalledTimes(1);
+  const opinion = await formatOpinionAsync({
     ship: false,
     concern: "commands replace inherited context with another context",
     model: context,
   });
-  expect(review).not.toHaveBeenCalled();
+  expect(JSON.stringify(opinion)).toContain("inherited context replacement");
+  expect(JSON.stringify(opinion)).not.toContain("the reported concern");
 });
 
 it("selects prepared reads with System 1 and retains a single final generation", async () => {

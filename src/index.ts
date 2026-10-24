@@ -2264,14 +2264,6 @@ export async function rewriteOpinionConcern(
     };
   }
 
-  if (model.classify)
-    return {
-      concern: "the reported concern",
-      rewritten: false,
-      provider: "local",
-      model: "attention-template",
-    };
-
   const maxAttempts =
     request.maxAttempts === undefined
       ? 2
@@ -2357,16 +2349,6 @@ export async function formatOpinionAsync(
     return formatOpinion({
       ship: options.ship,
       concern: options.concern,
-      remainingCount,
-      change: options.change,
-      posture: options.posture,
-    });
-  }
-
-  if (options.model.classify) {
-    return formatOpinion({
-      ship: options.ship,
-      concern: "the reported concern",
       remainingCount,
       change: options.change,
       posture: options.posture,

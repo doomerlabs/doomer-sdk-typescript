@@ -14,6 +14,7 @@ import {
   classifierPolicyError,
   confidentChoice,
   reviewWithValidation,
+  validateModelOutput,
 } from "./model.js";
 import {
   RepositoryReadError,
@@ -252,6 +253,7 @@ export async function reviewWithRepositoryTools<T>(
   runnerChange?: ModelRepositoryChange | null,
   reviewer?: string,
 ): Promise<ModelReviewResult<T>> {
+  const attentionModel = retrievalAttentionModel(model);
   if (repositoryRoot === undefined || repositoryRoot.trim() === "") {
     throw new ModelReviewError("Repository model tools require a rule-context repository root.", {
       code: "invalid_model_request",
@@ -477,9 +479,9 @@ export async function reviewWithRepositoryTools<T>(
       !exhausted
     ) {
       rounds += 1;
-      const selectedPlan = model.classify
+      const selectedPlan = attentionModel.classify
         ? await selectAttentionReads(
-            model,
+            attentionModel,
             request,
             toolResults,
             completed,
@@ -613,15 +615,17 @@ export async function reviewWithRepositoryTools<T>(
     ...(coverage ? { coverage, changedHunksCovered: coverage.status === "complete" } : {}),
   };
   const configuration =
-    model.classify && request.attentionTask
-      ? await selectAttentionConfiguration<T>(model, request, toolResults)
+    attentionModel.classify && request.attentionTask
+      ? await selectAttentionConfiguration<T>(attentionModel, request, toolResults)
       : undefined;
+  let configurationPending = configuration !== undefined;
   const finalModel: ReviewModel = configuration
     ? {
-        review: async <Output>() => ({
-          ...configuration,
-          output: configuration.output as unknown as Output,
-        }),
+        review: async <Output>(attempt: ModelReviewRequest<Output>) => {
+          if (!configurationPending) return model.review<Output>(attempt);
+          configurationPending = false;
+          return { ...configuration, output: configuration.output as unknown as Output };
+        },
       }
     : model;
   const finalResult = await reviewWithValidation<T>(
@@ -887,10 +891,27 @@ function isMetadataOnlyPatch(content: string): boolean {
   );
 }
 
+type AttentionModel = Pick<ReviewModel, "classify">;
+
+function retrievalAttentionModel(model: ReviewModel): AttentionModel {
+  const attention: AttentionModel = {};
+  const classify = model.classify?.bind(model);
+  if (classify)
+    attention.classify = async (request) => {
+      try {
+        return await classify(request);
+      } catch (error) {
+        if (!classifierPolicyError(error)) attention.classify = undefined;
+        throw error;
+      }
+    };
+  return attention;
+}
+
 // Parse literal repository commands; System 1 selects among them. Variable
 // expansion, dynamic scope and unusual commands go to the existing model.
 async function selectAttentionConfiguration<T>(
-  model: ReviewModel,
+  model: AttentionModel,
   request: ModelReviewRequest,
   results: RepositoryToolResult[],
 ): Promise<ModelReviewResult<T> | undefined> {
@@ -960,30 +981,35 @@ async function selectAttentionConfiguration<T>(
     if (index < 0) return undefined;
     const plan = plans[index];
     if (!plan) return undefined;
+    const output = (
+      request.attentionTask === "configuration-gosec" ? { tags: plan.tags } : plan
+    ) as T;
+    validateModelOutput(request.schema, output);
     return {
-      output: (request.attentionTask === "configuration-gosec" ? { tags: plan.tags } : plan) as T,
+      output,
       provider: "concentrate",
       model: "typesafe/jev",
     };
   } catch (error) {
-    if (classifierPolicyError(error)) throw error;
+    if (
+      classifierPolicyError(error) ||
+      (error instanceof ModelReviewError && error.code === "invalid_model_schema")
+    )
+      throw error;
     return undefined;
   }
 }
 
 // Selection does not invent paths or execute tools. Guarded SDK readers still
 // enforce exclusions, byte limits and immutable citation construction.
-async function selectAttentionReads(
-  model: ReviewModel,
-  request: ModelReviewRequest,
+function attentionReadCandidates(
+  input: unknown,
   results: RepositoryToolResult[],
   completed: Set<string>,
   budget: RepositoryToolBudget,
-  change: ModelRepositoryChange | null | undefined,
   include: RegExp[],
   exclude: RepositoryExclusions,
-): Promise<RepositoryPlan | undefined> {
-  if (!model.classify) return undefined;
+): RepositoryOperation[] {
   const candidates: RepositoryOperation[] = [];
   const keys = new Set<string>();
   const add = (op: RepositoryOperation) => {
@@ -1051,7 +1077,11 @@ async function selectAttentionReads(
       for (const [k, v] of Object.entries(value)) visit(v, k, depth + 1);
     }
   };
-  visit(request.input);
+  visit(input);
+  return candidates;
+}
+
+function attentionReadQuestions(candidates: RepositoryOperation[]): Record<string, ChoiceQuestion> {
   const questions: Record<string, ChoiceQuestion> = {
     ready: {
       type: "choice",
@@ -1075,6 +1105,29 @@ async function selectAttentionReads(
       },
     };
   });
+  return questions;
+}
+
+async function selectAttentionReads(
+  model: AttentionModel,
+  request: ModelReviewRequest,
+  results: RepositoryToolResult[],
+  completed: Set<string>,
+  budget: RepositoryToolBudget,
+  change: ModelRepositoryChange | null | undefined,
+  include: RegExp[],
+  exclude: RepositoryExclusions,
+): Promise<RepositoryPlan | undefined> {
+  if (!model.classify) return undefined;
+  const candidates = attentionReadCandidates(
+    request.input,
+    results,
+    completed,
+    budget,
+    include,
+    exclude,
+  );
+  const questions = attentionReadQuestions(candidates);
   try {
     const answers = await model.classify({
       state: {
