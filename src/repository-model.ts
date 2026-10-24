@@ -893,6 +893,19 @@ function isMetadataOnlyPatch(content: string): boolean {
 
 type AttentionModel = Pick<ReviewModel, "classify">;
 
+function classifierUnavailable(error: unknown): boolean {
+  return (
+    error instanceof ModelReviewError &&
+    typeof error.code === "string" &&
+    [
+      "broker_unavailable",
+      "model_timeout",
+      "attention_classification_failed",
+      "rate_limited",
+    ].includes(error.code)
+  );
+}
+
 function retrievalAttentionModel(model: ReviewModel): AttentionModel {
   const attention: AttentionModel = {};
   const classify = model.classify?.bind(model);
@@ -901,7 +914,7 @@ function retrievalAttentionModel(model: ReviewModel): AttentionModel {
       try {
         return await classify(request);
       } catch (error) {
-        if (!classifierPolicyError(error)) attention.classify = undefined;
+        if (classifierUnavailable(error)) attention.classify = undefined;
         throw error;
       }
     };
