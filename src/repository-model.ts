@@ -911,7 +911,15 @@ function classifierUnavailable(error: unknown): boolean {
   const unavailableResponse =
     typeof status === "number" &&
     (status >= 500 || [401, 403, 404, 405, 408, 429].includes(status));
-  return error.retryable || unavailableResponse;
+  // Custom adapters may expose only a legacy availability code, without either
+  // retryability or an HTTP status. Retain that compatibility fallback too.
+  const legacyAvailability = [
+    "broker_unavailable",
+    "model_timeout",
+    "attention_classification_failed",
+    "rate_limited",
+  ].includes(error.code ?? "");
+  return error.retryable || unavailableResponse || legacyAvailability;
 }
 
 function retrievalAttentionModel(model: ReviewModel): AttentionModel {
