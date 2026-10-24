@@ -1,0 +1,19 @@
+package.json
+  s_8e2af51b4f8674::t_96c7e6122ff098 30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7126199e041ab2b0412bcdb1045188931c002285",
+  "prompts": {},
+  "sessions": {
+    "s_8e2af51b4f8674": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16917-73f8-7e00-a989-fa0821f43afe",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Marc Campbell <marc.e.campbell@gmail.com>"
+    }
+  }
+}
