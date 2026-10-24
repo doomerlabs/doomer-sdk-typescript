@@ -42,6 +42,9 @@ export {
   type ReviewSource,
 } from "./review-sources.js";
 
+export { confidentChoice, classifierPolicyError } from "./model.js";
+export type { ChoiceQuestion, ChoiceRequest, ChoiceAnswer, ChoiceAnswers } from "./model.js";
+
 export {
   ADVERSARY_MODEL_ENDPOINT_ENV,
   ADVERSARY_MODEL_PROTOCOL_VERSION,
@@ -2261,6 +2264,14 @@ export async function rewriteOpinionConcern(
     };
   }
 
+  if (model.classify)
+    return {
+      concern: "the reported concern",
+      rewritten: false,
+      provider: "local",
+      model: "attention-template",
+    };
+
   const maxAttempts =
     request.maxAttempts === undefined
       ? 2
@@ -2352,6 +2363,16 @@ export async function formatOpinionAsync(
     });
   }
 
+  if (options.model.classify) {
+    return formatOpinion({
+      ship: options.ship,
+      concern: "the reported concern",
+      remainingCount,
+      change: options.change,
+      posture: options.posture,
+    });
+  }
+
   let concern: string;
   try {
     const rewritten = await rewriteOpinionConcern(options.model, {
@@ -2384,6 +2405,7 @@ export function enhanceReviewModel(
   reviewer?: string,
 ): ContextualReviewModel {
   return {
+    ...(model.classify ? { classify: model.classify.bind(model) } : {}),
     review: (request) =>
       request.tools?.repository === undefined
         ? reviewWithValidation(model, request)

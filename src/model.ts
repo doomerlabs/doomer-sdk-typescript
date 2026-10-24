@@ -65,6 +65,8 @@ export interface ModelReviewValidation<T = unknown> {
 }
 
 export interface ModelReviewRequest<T = unknown> {
+  /** Attention-only choice task; ordinary reviews ignore this SDK-local hint. */
+  attentionTask?: "configuration-go-vet" | "configuration-gosec";
   /** Local timing classification only; never sent to the broker or model. */
   diagnosticStage?: "model_review" | "repository_planning";
   prompt: string;
@@ -91,11 +93,41 @@ export interface ModelReviewResult<T = unknown> {
   retrieval?: ModelRepositoryRetrieval;
 }
 
+export interface ChoiceQuestion {
+  type: "choice";
+  instructions: string;
+  criteria: Record<string, string>;
+}
+export interface ChoiceRequest {
+  state: unknown;
+  questions: Record<string, ChoiceQuestion>;
+  timeoutMs?: number;
+}
+export interface ChoiceAnswer {
+  type: "choice";
+  choice: string;
+  confidence: number;
+  probabilities: Record<string, number>;
+}
+export type ChoiceAnswers = Record<string, ChoiceAnswer>;
+
+export function confidentChoice(answer: ChoiceAnswer | undefined, choice: string): boolean {
+  return (
+    answer?.choice === choice && Number.isFinite(answer.confidence) && answer.confidence >= 0.85
+  );
+}
+export function classifierPolicyError(error: unknown): boolean {
+  return error instanceof ModelReviewError && error.code === "classifier_policy_blocked";
+}
+
 export interface ReviewModel {
   review<T = unknown>(request: ModelReviewRequest<T>): Promise<ModelReviewResult<T>>;
+  /** Present only when the host authorizes attention-routing System 1 calls. */
+  classify?(request: ChoiceRequest): Promise<ChoiceAnswers>;
 }
 
 export interface BrokerReviewModelOptions {
+  attentionSystem1?: boolean;
   maximumAttempts?: number;
   initialRetryDelayMs?: number;
   random?: () => number;
@@ -218,7 +250,9 @@ export function createModelFromEnvironment(
   if (endpoint === undefined || endpoint === "" || token === undefined || token === "") {
     return unavailableModel();
   }
-  return new BrokerReviewModel(endpoint, token);
+  return new BrokerReviewModel(endpoint, token, {
+    attentionSystem1: environment.ADVERSARY_ATTENTION_SYSTEM1 === "1",
+  });
 }
 
 export function unavailableModel(): ReviewModel {
@@ -230,6 +264,7 @@ export function unavailableModel(): ReviewModel {
 }
 
 export class BrokerReviewModel implements ReviewModel {
+  declare readonly classify?: (request: ChoiceRequest) => Promise<ChoiceAnswers>;
   readonly endpoint: string;
   readonly #token: string;
   readonly #maximumAttempts: number;
@@ -264,6 +299,85 @@ export class BrokerReviewModel implements ReviewModel {
     this.#maximumAttempts = maximumAttempts;
     this.#initialRetryDelayMs = initialRetryDelayMs;
     this.#random = options.random ?? Math.random;
+    if (options.attentionSystem1 === true) this.classify = (request) => this.#classify(request);
+  }
+
+  async #classify(request: ChoiceRequest): Promise<ChoiceAnswers> {
+    const timeoutMs = request.timeoutMs ?? 45_000;
+    requireIntegerRange(timeoutMs, "choice timeoutMs", 1, 45_000);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const endpoint = new URL(this.endpoint);
+      endpoint.pathname = "/v1/choices";
+      const body = JSON.stringify({ state: request.state, questions: request.questions });
+      if (Buffer.byteLength(body) > 1 << 20 || Object.keys(request.questions).length === 0)
+        throw new ModelReviewError("Invalid choice request size.", {
+          code: "invalid_choice_request",
+        });
+      const response = await fetch(endpoint, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${this.#token}`,
+          "x-adversary-model-protocol": String(ADVERSARY_MODEL_PROTOCOL_VERSION),
+        },
+        body,
+      });
+      const raw = await readBoundedResponse(response);
+      let payload: { answers?: ChoiceAnswers; error?: { code?: string } };
+      try {
+        payload = JSON.parse(raw);
+      } catch {
+        throw new ModelReviewError("Invalid classifier response.", {
+          code: "invalid_choice_response",
+        });
+      }
+      if (!response.ok)
+        throw new ModelReviewError("Attention classifier unavailable.", {
+          code:
+            payload.error?.code === "classifier_policy_blocked"
+              ? "classifier_policy_blocked"
+              : "attention_classification_failed",
+        });
+      const answers = payload.answers;
+      if (!answers || Object.keys(answers).length !== Object.keys(request.questions).length)
+        throw new ModelReviewError("Incomplete classifier response.", {
+          code: "invalid_choice_response",
+        });
+      for (const [id, question] of Object.entries(request.questions)) {
+        const answer = answers[id];
+        const choices = Object.keys(question.criteria);
+        if (
+          !answer ||
+          answer.type !== "choice" ||
+          !choices.includes(answer.choice) ||
+          !Number.isFinite(answer.confidence) ||
+          answer.confidence < 0 ||
+          answer.confidence > 1 ||
+          !answer.probabilities ||
+          Object.keys(answer.probabilities).length !== choices.length ||
+          choices.some((key) => {
+            const probability = answer.probabilities[key];
+            return (
+              typeof probability !== "number" ||
+              !Number.isFinite(probability) ||
+              probability < 0 ||
+              probability > 1
+            );
+          }) ||
+          Math.abs(choices.reduce((sum, key) => sum + (answer.probabilities[key] ?? 0), 0) - 1) >
+            0.01
+        )
+          throw new ModelReviewError("Invalid classifier choices.", {
+            code: "invalid_choice_response",
+          });
+      }
+      return answers;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async review<T = unknown>(request: ModelReviewRequest<T>): Promise<ModelReviewResult<T>> {
