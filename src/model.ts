@@ -886,6 +886,7 @@ function choiceResponseFailure(status: number, payload?: unknown): ModelReviewEr
         ? failure.code
         : "attention_classification_failed",
     retryable: typeof failure?.retryable === "boolean" ? failure.retryable : status >= 500,
+    diagnostics: { httpStatus: status },
   });
 }
 

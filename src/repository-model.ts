@@ -904,18 +904,14 @@ function classifierUnavailable(error: unknown): boolean {
     "model_response_too_large",
   ].includes(error.code ?? "");
   if (protocolFailure) return false;
-  // HTTP 5xx and transport failures carry retryability, including broker-specific
-  // codes we do not know. Keep known availability errors without retryability
-  // (for example an unavailable /v1/choices route returning HTTP 404) covered too.
-  return (
-    error.retryable ||
-    [
-      "broker_unavailable",
-      "model_timeout",
-      "attention_classification_failed",
-      "rate_limited",
-    ].includes(error.code ?? "")
-  );
+  // Preserve the HTTP signal independently of the broker's error code or retry
+  // policy: an absent route or unavailable server remains unavailable even when
+  // its envelope says that retrying the same request would not help.
+  const status = error.diagnostics?.httpStatus;
+  const unavailableResponse =
+    typeof status === "number" &&
+    (status >= 500 || [401, 403, 404, 405, 408, 429].includes(status));
+  return error.retryable || unavailableResponse;
 }
 
 function retrievalAttentionModel(model: ReviewModel): AttentionModel {

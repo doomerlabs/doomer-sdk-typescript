@@ -190,14 +190,17 @@ it.each([
   { code: "bad_gateway", retryable: true },
   { code: "a_new_broker_availability_code", retryable: true },
   { code: undefined, retryable: true },
-  { code: "attention_classification_failed", retryable: false },
+  { code: "attention_classification_failed", retryable: false, diagnostics: { httpStatus: 404 } },
+  { code: "not_found", retryable: false, diagnostics: { httpStatus: 404 } },
+  { code: "a_new_provider_error", retryable: false, diagnostics: { httpStatus: 503 } },
+  { code: "rate_limited", retryable: false, diagnostics: { httpStatus: 429 } },
 ])(
   "disables availability failure %j for one retrieval, then probes again on the next retrieval",
-  async ({ code, retryable }) => {
+  async ({ code, retryable, diagnostics }) => {
     const root = await mkdtemp(join(tmpdir(), "attention-availability-"));
     const classifier = vi
       .fn()
-      .mockRejectedValue(new ModelReviewError("Unavailable", { code, retryable }));
+      .mockRejectedValue(new ModelReviewError("Unavailable", { code, retryable, diagnostics }));
     let rounds = 0;
     const model: ReviewModel = {
       classify: classifier,
@@ -345,3 +348,62 @@ it.each([
     await rm(root, { recursive: true, force: true });
   }
 });
+
+it.each([404, 503])(
+  "preserves HTTP %s availability for an unknown non-retryable broker code end to end",
+  async (status) => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({ error: { code: "previously_unknown_failure", retryable: false } }),
+          { status },
+        ),
+    );
+    const root = await mkdtemp(join(tmpdir(), "attention-http-availability-"));
+    const broker = new BrokerReviewModel("http://127.0.0.1:43123/v1/review", "fixture", {
+      attentionSystem1: true,
+    });
+    if (!broker.classify) throw new Error("Missing attention capability");
+    const classifier = vi.fn(broker.classify);
+    let rounds = 0;
+    const model: ReviewModel = {
+      classify: classifier,
+      async review<T>(request: ModelReviewRequest<T>) {
+        const planning = request.diagnosticStage === "repository_planning";
+        if (planning) rounds++;
+        const output = !planning
+          ? { findings: [] }
+          : rounds % 2 === 0
+            ? { ready: true, operations: [] }
+            : {
+                ready: false,
+                operations: [
+                  { tool: "read_file", path: "app.ts", cursor: 0, startLine: 1, endLine: 10 },
+                ],
+              };
+        return { output: output as T, provider: "fixture", model: "fallback" };
+      },
+    };
+    try {
+      await writeFile(join(root, "app.ts"), "export const value = 1;\n");
+      for (let run = 0; run < 2; run++) {
+        await reviewWithRepositoryTools(model, root, {
+          prompt: "Review",
+          input: {},
+          schema: { type: "object" },
+          tools: { repository: {} },
+        });
+        expect(classifier).toHaveBeenCalledTimes(run + 1);
+        expect(rounds).toBe((run + 1) * 2);
+      }
+      const failure = await classifier.mock.results[0]?.value.catch((error: unknown) => error);
+      expect(failure).toMatchObject({
+        code: "previously_unknown_failure",
+        retryable: false,
+        diagnostics: { httpStatus: status },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
