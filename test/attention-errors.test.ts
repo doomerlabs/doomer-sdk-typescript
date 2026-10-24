@@ -181,13 +181,23 @@ it("falls back to generation when a selected configuration violates the requeste
   }
 });
 
-it.each(["broker_unavailable", "model_timeout", "attention_classification_failed", "rate_limited"])(
-  "disables %s for one retrieval, then probes again on the next retrieval",
-  async (code) => {
+it.each([
+  { code: "broker_unavailable", retryable: true },
+  { code: "model_timeout", retryable: true },
+  { code: "attention_classification_failed", retryable: true },
+  { code: "rate_limited", retryable: true },
+  { code: "provider_unavailable", retryable: true },
+  { code: "bad_gateway", retryable: true },
+  { code: "a_new_broker_availability_code", retryable: true },
+  { code: undefined, retryable: true },
+  { code: "attention_classification_failed", retryable: false },
+])(
+  "disables availability failure %j for one retrieval, then probes again on the next retrieval",
+  async ({ code, retryable }) => {
     const root = await mkdtemp(join(tmpdir(), "attention-availability-"));
     const classifier = vi
       .fn()
-      .mockRejectedValue(new ModelReviewError("Unavailable", { code, retryable: true }));
+      .mockRejectedValue(new ModelReviewError("Unavailable", { code, retryable }));
     let rounds = 0;
     const model: ReviewModel = {
       classify: classifier,
@@ -296,42 +306,42 @@ it("never bypasses a host classifier policy rejection with generation", async ()
   }
 });
 
-it.each(["invalid_choice_response", "model_response_too_large"])(
-  "retains classification after a %s protocol error",
-  async (code) => {
-    const root = await mkdtemp(join(tmpdir(), "attention-protocol-recovery-"));
-    const classifier = vi
-      .fn()
-      .mockRejectedValueOnce(new ModelReviewError("Malformed response", { code }))
-      .mockImplementation(async (request) => answersFor(request));
-    const review = vi.fn(async <T>(request: ModelReviewRequest<T>) => ({
-      output: (request.diagnosticStage === "repository_planning"
-        ? {
-            ready: false,
-            operations: [
-              { tool: "read_file", path: "app.ts", cursor: 0, startLine: 1, endLine: 10 },
-            ],
-          }
-        : { findings: [] }) as T,
-      provider: "fixture",
-      model: "fallback",
-    }));
-    try {
-      await writeFile(join(root, "app.ts"), "export const value = 1;\n");
-      const result = await reviewWithRepositoryTools({ classify: classifier, review }, root, {
-        prompt: "Review",
-        input: {},
-        schema: { type: "object" },
-        tools: { repository: {} },
-      });
-      expect(result.output).toEqual({ findings: [] });
-      expect(classifier).toHaveBeenCalledTimes(2);
-      expect(review).toHaveBeenCalledTimes(2);
-      expect(
-        review.mock.calls.filter(([request]) => request.diagnosticStage === "repository_planning"),
-      ).toHaveLength(1);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  },
-);
+it.each([
+  "invalid_choice_response",
+  "model_response_too_large",
+  "invalid_choice_request",
+  "invalid_model_budget",
+])("retains classification after a %s protocol error", async (code) => {
+  const root = await mkdtemp(join(tmpdir(), "attention-protocol-recovery-"));
+  const classifier = vi
+    .fn()
+    .mockRejectedValueOnce(new ModelReviewError("Malformed response", { code, retryable: true }))
+    .mockImplementation(async (request) => answersFor(request));
+  const review = vi.fn(async <T>(request: ModelReviewRequest<T>) => ({
+    output: (request.diagnosticStage === "repository_planning"
+      ? {
+          ready: false,
+          operations: [{ tool: "read_file", path: "app.ts", cursor: 0, startLine: 1, endLine: 10 }],
+        }
+      : { findings: [] }) as T,
+    provider: "fixture",
+    model: "fallback",
+  }));
+  try {
+    await writeFile(join(root, "app.ts"), "export const value = 1;\n");
+    const result = await reviewWithRepositoryTools({ classify: classifier, review }, root, {
+      prompt: "Review",
+      input: {},
+      schema: { type: "object" },
+      tools: { repository: {} },
+    });
+    expect(result.output).toEqual({ findings: [] });
+    expect(classifier).toHaveBeenCalledTimes(2);
+    expect(review).toHaveBeenCalledTimes(2);
+    expect(
+      review.mock.calls.filter(([request]) => request.diagnosticStage === "repository_planning"),
+    ).toHaveLength(1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

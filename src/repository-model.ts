@@ -894,15 +894,27 @@ function isMetadataOnlyPatch(content: string): boolean {
 type AttentionModel = Pick<ReviewModel, "classify">;
 
 function classifierUnavailable(error: unknown): boolean {
+  if (!(error instanceof ModelReviewError) || classifierPolicyError(error)) return false;
+  // A malformed response/request is not evidence that the service is unavailable,
+  // even if an adapter incorrectly marks that validation error as retryable.
+  const protocolFailure = [
+    "invalid_choice_response",
+    "invalid_choice_request",
+    "invalid_model_budget",
+    "model_response_too_large",
+  ].includes(error.code ?? "");
+  if (protocolFailure) return false;
+  // HTTP 5xx and transport failures carry retryability, including broker-specific
+  // codes we do not know. Keep known availability errors without retryability
+  // (for example an unavailable /v1/choices route returning HTTP 404) covered too.
   return (
-    error instanceof ModelReviewError &&
-    typeof error.code === "string" &&
+    error.retryable ||
     [
       "broker_unavailable",
       "model_timeout",
       "attention_classification_failed",
       "rate_limited",
-    ].includes(error.code)
+    ].includes(error.code ?? "")
   );
 }
 
