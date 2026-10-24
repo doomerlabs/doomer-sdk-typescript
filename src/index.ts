@@ -42,6 +42,9 @@ export {
   type ReviewSource,
 } from "./review-sources.js";
 
+export { confidentChoice, classifierPolicyError } from "./model.js";
+export type { ChoiceQuestion, ChoiceRequest, ChoiceAnswer, ChoiceAnswers } from "./model.js";
+
 export {
   ADVERSARY_MODEL_ENDPOINT_ENV,
   ADVERSARY_MODEL_PROTOCOL_VERSION,
@@ -2384,6 +2387,7 @@ export function enhanceReviewModel(
   reviewer?: string,
 ): ContextualReviewModel {
   return {
+    ...(model.classify ? { classify: model.classify.bind(model) } : {}),
     review: (request) =>
       request.tools?.repository === undefined
         ? reviewWithValidation(model, request)

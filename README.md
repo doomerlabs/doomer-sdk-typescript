@@ -1298,3 +1298,17 @@ assignments; it cannot identify every domain-specific secret. Output is evidence
 or executable HTML. The `sources` and `sourceIds` fields are optional, preserving
 legacy reviews. Deploy a runner supporting these fields before releasing an
 adversary that emits them; older strict protocol decoders reject unknown fields.
+
+### Optional attention-routing classification
+
+A host can opt a reviewer into typed System 1 decisions with
+`ADVERSARY_ATTENTION_SYSTEM1=1` and an authenticated `/v1/choices` broker route.
+Only then does the environment-created model expose `classify`. The SDK can use
+that capability for bounded repository-read selection and explicit configuration
+selection; final review generation and uncertain decisions retain their existing
+paths. Ordinary models do not expose the capability and keep the existing
+retrieval, review, and opinion behavior.
+
+This is a host-controlled capability, not a setting to read from a reviewed
+repository. An unavailable or uncertain classification preserves generative
+fallback; a host policy rejection is propagated rather than bypassed.
